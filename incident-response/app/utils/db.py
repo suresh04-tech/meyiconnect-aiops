@@ -1,15 +1,10 @@
-"""
-utils/db.py
-───────────
-Database connection helper — identical logic to the Lambda version,
-adapted for Docker (SSL mode configurable via DB_SSL_MODE env var).
-"""
-
 import os
+import json
 import psycopg2
 import psycopg2.extras
 from contextlib import contextmanager
 
+# ─── DB Connection ────────────────────────────────────────────────────────────
 
 def get_connection():
     return psycopg2.connect(
@@ -22,7 +17,6 @@ def get_connection():
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
 
-
 @contextmanager
 def get_db():
     conn = get_connection()
@@ -34,3 +28,36 @@ def get_db():
         raise
     finally:
         conn.close()
+
+
+# ─── HTTP Response Helpers ────────────────────────────────────────────────────
+
+def _response(status_code: int, body: dict) -> dict:
+    return {
+        "statusCode": status_code,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+        },
+        "body": json.dumps(body, default=str),
+    }
+
+
+def ok(body: dict) -> dict:
+    return _response(200, body)
+
+
+def created(body: dict) -> dict:
+    return _response(201, body)
+
+
+def bad_request(message: str) -> dict:
+    return _response(400, {"error": message})
+
+
+def not_found(message: str) -> dict:
+    return _response(404, {"error": message})
+
+
+def server_error(message: str) -> dict:
+    return _response(500, {"error": message})

@@ -12,8 +12,8 @@ GET /queue/stats
 """
 
 import logging
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter
+from pydantic import BaseModel
 from typing import Any
 
 from app.queue.manager import queue_manager
@@ -26,15 +26,6 @@ router = APIRouter()
 
 class EnqueueRequest(BaseModel):
     event_id:            str
-    instance_id:         str
-    issue:               str
-    severity:            str
-    incident_start_time: str  = Field(..., description="ISO 8601")
-    incident_end_time:   str  = Field(..., description="ISO 8601")
-    log_group_name:      str
-    region:              str  = "ap-south-1"
-    dependency_context:  dict[str, Any] = {}
-    incident_down_time:  str | None = None  # optional; defaults to incident_start_time
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -48,7 +39,9 @@ async def enqueue(body: EnqueueRequest):
     incident on their side. The background worker will pick it up,
     run EC2 + CloudWatch + Bedrock analysis, and store results in the DB.
     """
-    payload = body.model_dump()
+    payload = {
+        "event_id": body.event_id
+    }
     await queue_manager.enqueue(payload)
     logger.info(f"[/queue/enqueue] event_id={body.event_id} accepted")
     return {
