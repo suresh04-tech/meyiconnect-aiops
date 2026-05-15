@@ -29,10 +29,6 @@ LOG_FETCH_LIMIT           = int(os.environ.get("LOG_FETCH_LIMIT", "100"))
 ERROR_SCAN_WINDOW_MINUTES = int(os.environ.get("ERROR_SCAN_WINDOW_MINUTES", "30"))
 AI_LOG_LINE_LIMIT         = int(os.environ.get("AI_LOG_LINE_LIMIT", "200"))
 
-# ─── AWS Clients ───────────────────────────────────────────────────────────────
-
-bedrock = boto3.client("bedrock-runtime", region_name=REGION)
-
 ERROR_PATTERN = re.compile(
     r"error|exception|fatal|critical|fail|traceback|panic",
     re.IGNORECASE,
@@ -340,6 +336,8 @@ def invoke_bedrock_rca(ai_context: dict) -> dict:
     stack_hints = detect_stack(ai_context)
     logger.info(f"Detected stack: {stack_hints}")
     prompt = _build_prompt(ai_context, stack_hints)
+
+    bedrock = boto3.client("bedrock-runtime", region_name=REGION)
 
     body = {"prompt": prompt, "max_gen_len": 4096, "temperature": 0.2, "top_p": 0.9}
     resp = bedrock.invoke_model(
