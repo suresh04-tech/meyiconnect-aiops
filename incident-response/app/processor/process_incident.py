@@ -419,23 +419,43 @@ def process_incident(payload: dict) -> None:
     event_id = payload.get("event_id", "unknown")
 
     try:
-        instance_id    = payload["instance_id"]
-        issue          = payload["issue"]
-        severity       = payload["severity"]
-        log_group_name = payload["log_group_name"]
-        region         = payload.get("region", "ap-south-1")
-        dependency_ctx = payload.get("dependency_context", {})
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM meyiconnect.incidents WHERE event_id = %s LIMIT 1",
+                    (event_id,)
+                )
+                incident = cur.fetchone()
 
-        incident_start = datetime.fromisoformat(
-            payload["incident_start_time"].replace("Z", "+00:00")
-        )
-        incident_end = datetime.fromisoformat(
-            payload["incident_end_time"].replace("Z", "+00:00")
-        )
-        incident_down_time = datetime.fromisoformat(
-            payload.get("incident_down_time", payload["incident_start_time"])
-                   .replace("Z", "+00:00")
-        )
+        if not incident:
+            logger.error(f"Incident not found in DB for event_id: {event_id}")
+            return
+
+        instance_id    = incident["instance_id"]
+        issue          = incident["issue"]
+        severity       = incident["severity"]
+        log_group_name = incident["log_group_name"]
+        region         = incident.get("region") or "ap-south-1"
+
+        dependency_ctx = incident.get("dependency_context") or {}
+        if isinstance(dependency_ctx, str):
+            try:
+                dependency_ctx = json.loads(dependency_ctx)
+            except Exception:
+                dependency_ctx = {}
+
+        def _parse_time(dt_val):
+            if not dt_val:
+                return None
+            if isinstance(dt_val, str):
+                return datetime.fromisoformat(dt_val.replace("Z", "+00:00"))
+            if dt_val.tzinfo is None:
+                return dt_val.replace(tzinfo=timezone.utc)
+            return dt_val
+
+        incident_start = _parse_time(incident["incident_start_time"])
+        incident_end = _parse_time(incident["incident_end_time"])
+        incident_down_time = _parse_time(incident.get("incident_down_time")) or incident_start
 
         logger.info(
             f"Processing event: {event_id} | instance: {instance_id} | "
@@ -508,9 +528,9 @@ def process_incident(payload: dict) -> None:
                 "event_id":            event_id,
                 "issue":               issue,
                 "severity":            severity,
-                "incident_start_time": payload["incident_start_time"],
-                "incident_end_time":   payload["incident_end_time"],
-                "incident_down_time":  payload.get("incident_down_time"),
+                "incident_start_time": incident_start.isoformat() if incident_start else None,
+                "incident_end_time":   incident_end.isoformat() if incident_end else None,
+                "incident_down_time":  incident_down_time.isoformat() if incident_down_time else None,
             },
             "ec2": {
                 "details":       ec2["details"],
