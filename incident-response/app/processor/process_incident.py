@@ -1,12 +1,23 @@
 """
 processor/process_incident.py
 ─────────────────────────────
-Core RCA processing logic — adapted from the original Lambda handler.
+Core RCA processing logic — called by the worker thread pool.
 
-Key changes from Lambda version:
-  • No SQS record wrapping — payload is the dict directly
-  • Runs synchronously (called from thread pool via worker.py)
-  • All boto3 / DB calls unchanged
+What's changed from previous version
+──────────────────────────────────────
+• Only incident_down_time is required from DB.  incident_start_time and
+  incident_end_time are no longer used — the log_processor derives smarter
+  windows automatically using adaptive lookback + first-error anchoring.
+
+• severity and issue are forwarded to log_processor so the adaptive window
+  calculator can decide the correct lookback (e.g. 60 min for critical/OOM).
+
+• The Bedrock prompt is now stage-aware: it shows the three-stage labelled
+  timeline (buildup / failure / impact) so the model can reason about when
+  the problem started vs when it was detected.
+
+• Multi-log-group support: log_group_names column (JSON array, CSV, or single
+  value) is parsed and all groups are processed in parallel.
 """
 
 import os
@@ -18,26 +29,18 @@ from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.utils.db import get_db
+from processor.log_processor import fetch_and_compress_logs
 
 logger = logging.getLogger(__name__)
 
 # ─── Config ────────────────────────────────────────────────────────────────────
-
-REGION                    = os.environ.get("AWS_REGION", "ap-south-1")
-BEDROCK_MODEL             = os.environ.get("BEDROCK_MODEL_ID", "meta.llama3-8b-instruct-v1:0")
-LOG_FETCH_LIMIT           = int(os.environ.get("LOG_FETCH_LIMIT", "100"))
-ERROR_SCAN_WINDOW_MINUTES = int(os.environ.get("ERROR_SCAN_WINDOW_MINUTES", "30"))
-AI_LOG_LINE_LIMIT         = int(os.environ.get("AI_LOG_LINE_LIMIT", "200"))
-
-ERROR_PATTERN = re.compile(
-    r"error|exception|fatal|critical|fail|traceback|panic",
-    re.IGNORECASE,
-)
+REGION        = os.environ.get("AWS_REGION", "ap-south-1")
+BEDROCK_MODEL = os.environ.get("BEDROCK_MODEL_ID", "meta.llama3-8b-instruct-v1:0")
 
 
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 1 — CloudWatch Metrics
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _get_metric(cw_client, namespace, metric_name, instance_id,
                 stat="Average", window_minutes=15):
@@ -56,10 +59,9 @@ def _get_metric(cw_client, namespace, metric_name, instance_id,
         points = resp.get("Datapoints", [])
         if not points:
             return None
-        latest = sorted(points, key=lambda x: x["Timestamp"], reverse=True)[0]
-        return latest.get(stat)
-    except Exception as e:
-        logger.warning(f"Metric {metric_name} fetch failed: {e}")
+        return sorted(points, key=lambda x: x["Timestamp"], reverse=True)[0].get(stat)
+    except Exception as exc:
+        logger.warning(f"Metric {metric_name} fetch failed: {exc}")
         return None
 
 
@@ -89,16 +91,16 @@ def get_all_metrics(cw_client, instance_id: str) -> dict:
     return results
 
 
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 2 — EC2 Details
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def get_ec2_details(ec2_client, instance_id: str) -> dict:
     logger.info(f"Fetching EC2 details for: {instance_id}")
     details, status_checks = {}, {}
 
     try:
-        resp = ec2_client.describe_instances(InstanceIds=[instance_id])
+        resp         = ec2_client.describe_instances(InstanceIds=[instance_id])
         reservations = resp.get("Reservations", [])
         if reservations:
             inst = reservations[0]["Instances"][0]
@@ -120,11 +122,11 @@ def get_ec2_details(ec2_client, instance_id: str) -> dict:
                 ],
                 "tags": {t["Key"]: t["Value"] for t in inst.get("Tags", [])},
             }
-    except Exception as e:
-        logger.warning(f"describe_instances failed: {e}")
+    except Exception as exc:
+        logger.warning(f"describe_instances failed: {exc}")
 
     try:
-        resp = ec2_client.describe_instance_status(
+        resp     = ec2_client.describe_instance_status(
             InstanceIds=[instance_id], IncludeAllInstances=True
         )
         statuses = resp.get("InstanceStatuses", [])
@@ -142,201 +144,190 @@ def get_ec2_details(ec2_client, instance_id: str) -> dict:
                     for d in s.get("SystemStatus", {}).get("Details", [])
                 ],
             }
-    except Exception as e:
-        logger.warning(f"describe_instance_status failed: {e}")
+    except Exception as exc:
+        logger.warning(f"describe_instance_status failed: {exc}")
 
     return {"details": details, "status_checks": status_checks}
 
 
-# ═══════════════════════════════════════════════════════════════
-# SECTION 3 — CloudWatch Logs (Two-Phase Strategy)
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — Token-safe Prompt Builder
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _fetch_raw_events(logs_client, log_group, start_ms, end_ms, limit=LOG_FETCH_LIMIT):
-    try:
-        resp = logs_client.filter_log_events(
-            logGroupName=log_group,
-            startTime=start_ms,
-            endTime=end_ms,
-            limit=limit,
-        )
-        return [
-            {"ts": e["timestamp"], "message": e["message"]}
-            for e in resp.get("events", [])
-            if e.get("message")
-        ]
-    except Exception as e:
-        logger.warning(f"Log fetch failed for {log_group}: {e}")
-        return []
+def _format_log_summary_for_prompt(log_data: dict) -> str:
+    """
+    Convert the compressed, stage-aware log_processor output into a compact,
+    readable text block for the Bedrock prompt.
+
+    Format per log group:
+        ┌─ LOG GROUP: /aws/aiops-test/nginx-error ─────────────────────────────
+        │ STAGE 1 — Pre-failure buildup  [09:43 – 09:48]
+        │   Lines: 42 | Errors: 0 | Warnings: 3
+        │   (no error/warn patterns)
+        │
+        │ STAGE 2 — Failure propagation  [09:48 – 10:00]
+        │   Lines: 187 | Errors: 143 | Warnings: 8
+        │   [x143] [ERROR] access forbidden by rule … request: "GET /pinfo.php …"
+        │   [x8]   [WARN]  upstream response time 29.8 …
+        │
+        │ STAGE 3 — Impact / recovery  [10:00 – 10:10]
+        │   Lines: 31 | Errors: 28 | Warnings: 0
+        │   [x28]  [ERROR] connect() failed (111: Connection refused) …
+        └──────────────────────────────────────────────────────────────────────
+    """
+    lines = []
+
+    per_group = log_data.get("per_group", {})
+    if not per_group:
+        return "No log data available."
+
+    stages_meta = {s["name"]: s for s in log_data.get("stages", [])}
+
+    for group_name, group_stages in per_group.items():
+        lines.append(f"\n╔═ LOG GROUP: {group_name}")
+
+        for stage_idx, (sname, summary) in enumerate(group_stages.items(), 1):
+            label  = summary.get("stage_label", sname)
+            window = summary.get("window", "")
+            lines.append(
+                f"║ STAGE {stage_idx} — {label}  [{window}]"
+            )
+            lines.append(
+                f"║   Lines: {summary['total_raw']} | "
+                f"Errors: {summary['error_count']} | "
+                f"Warnings: {summary['warn_count']}"
+            )
+
+            clusters = summary.get("clusters", [])
+            if clusters:
+                for c in clusters:
+                    tag    = f"[x{c['count']}]" if c["count"] > 1 else "      "
+                    level  = c["level"].upper()
+                    sample = (c["samples"][0] if c["samples"] else c["fingerprint"])[:250]
+                    lines.append(f"║   {tag} [{level}] {sample}")
+            else:
+                lines.append("║   (no error/warn patterns in this stage)")
+
+            ctx = summary.get("context_lines", [])
+            if ctx:
+                lines.append("║   Context:")
+                for cl in ctx[:5]:
+                    lines.append(f"║     {cl[:180]}")
+
+            lines.append("║")
+
+        lines.append("╚" + "═" * 60)
+
+    return "\n".join(lines)
 
 
-def discover_errors_around_downtime(logs_client, log_group, incident_down_time,
-                                    window_minutes=ERROR_SCAN_WINDOW_MINUTES):
-    scan_start = incident_down_time - timedelta(minutes=window_minutes)
-    scan_end   = incident_down_time + timedelta(minutes=window_minutes)
-    logger.info(f"[Phase-A] Scanning [{scan_start.isoformat()} — {scan_end.isoformat()}]")
-    events = _fetch_raw_events(
-        logs_client, log_group,
-        int(scan_start.timestamp() * 1000),
-        int(scan_end.timestamp() * 1000),
-        limit=500,
+def _build_prompt(
+    event_id:           str,
+    issue:              str,
+    severity:           str,
+    down_time_iso:      str,
+    ec2:                dict,
+    metrics:            dict,
+    log_data:           dict,
+    dependency_ctx:     dict,
+) -> str:
+    log_summary_text = _format_log_summary_for_prompt(log_data)
+    top_errors_text  = "\n".join(f"  • {e}" for e in log_data.get("top_errors", []))
+
+    anchor = log_data.get("anchor", {})
+    anchor_text = (
+        f"Pulse detected outage at : {down_time_iso}\n"
+        f"First error in logs      : {anchor.get('first_error_ts') or 'not found'}\n"
+        f"First error group        : {anchor.get('first_error_group') or 'n/a'}\n"
+        f"First error message      : {anchor.get('first_error_msg') or 'n/a'}\n"
+        f"Investigation anchored to: {anchor.get('true_start')}\n"
+        f"Adaptive lookback used   : {log_data.get('adaptive_window', {}).get('before_minutes')} min"
     )
-    error_events = [e for e in events if ERROR_PATTERN.search(e["message"])]
-    logger.info(f"[Phase-A] Found {len(error_events)} error events out of {len(events)} total")
-    return error_events
 
-
-def fetch_context_logs_for_errors(logs_client, log_group, error_events, incident_start,
-                                  context_buffer_minutes=5, ai_line_limit=AI_LOG_LINE_LIMIT):
-    if not error_events:
-        logger.info("[Phase-B] No error events — skipping context expansion")
-        return []
-
-    context_start_ms = int(incident_start.timestamp() * 1000)
-    seen:    set  = set()
-    ordered: list = []
-
-    for err in sorted(error_events, key=lambda e: e["ts"]):
-        context_end_ms = err["ts"] + int(context_buffer_minutes * 60 * 1000)
-        events = _fetch_raw_events(logs_client, log_group, context_start_ms, context_end_ms, limit=300)
-        for ev in events:
-            msg = ev["message"]
-            if msg not in seen:
-                seen.add(msg)
-                ordered.append(msg)
-        if len(ordered) >= ai_line_limit:
-            break
-
-    result = ordered[:ai_line_limit]
-    logger.info(f"[Phase-B] Final context log lines: {len(result)}")
-    return result
-
-
-def get_incident_logs_optimized(logs_client, log_group, incident_start,
-                                incident_end, incident_down_time):
-    error_events = discover_errors_around_downtime(logs_client, log_group, incident_down_time)
-
-    if error_events:
-        context_logs = fetch_context_logs_for_errors(
-            logs_client, log_group, error_events, incident_start
-        )
-    else:
-        logger.info("[Fallback] No Phase-A errors; fetching full incident window")
-        events = _fetch_raw_events(
-            logs_client, log_group,
-            int(incident_start.timestamp() * 1000),
-            int(incident_end.timestamp() * 1000),
-            limit=LOG_FETCH_LIMIT,
-        )
-        context_logs = [e["message"] for e in events]
-
-    top_errors = [e["message"] for e in error_events if ERROR_PATTERN.search(e["message"])][:10]
-
-    return {
-        "error_events": error_events,
-        "context_logs": context_logs,
-        "top_errors":   top_errors,
-    }
-
-
-# ═══════════════════════════════════════════════════════════════
-# SECTION 4 — Stack Detection
-# ═══════════════════════════════════════════════════════════════
-
-def detect_stack(ai_context: dict) -> list:
-    combined = (
-        json.dumps(ai_context.get("dependency_context", {})).lower()
-        + ai_context.get("incident", {}).get("issue", "").lower()
-        + " ".join(ai_context.get("logs", {}).get("top_errors", [])).lower()
+    d  = ec2.get("details", {})
+    sc = ec2.get("status_checks", {})
+    ec2_text = (
+        f"Instance : {d.get('instance_id')} ({d.get('instance_type')})  "
+        f"State: {d.get('state')}  AZ: {d.get('availability_zone')}\n"
+        f"Status   : instance={sc.get('instance_status')}  system={sc.get('system_status')}\n"
+        f"Tags     : {json.dumps(d.get('tags', {}))}"
     )
-    checks = [
-        (["docker", "container", "image", "dockerfile", "compose"],        "Docker"),
-        (["nginx", "apache", "httpd"],                                     "Nginx/Apache"),
-        (["redis", "elasticache", "cache"],                                "Redis"),
-        (["rds", "postgres", "postgresql", "mysql", "database", " db "],   "Database (RDS/Postgres/MySQL)"),
-        (["memory", "oom", "out of memory", "heap", "swap"],               "Memory/OOM"),
-        (["disk", "storage", "iops", "ebs", "no space"],                   "Disk/EBS"),
-        (["cpu", "utilization", "load average"],                            "CPU/Load"),
-        (["network", "timeout", "connection", "alb", "elb", "502", "503"], "Network/ALB"),
-        (["node", "npm", "javascript", "nodejs"],                           "Node.js"),
-        (["python", "pip", "django", "flask", "gunicorn"],                 "Python"),
-        (["java", "jvm", "spring", "heap space", "gc overhead"],           "Java/JVM"),
-        (["ssl", "tls", "certificate", "cert"],                            "SSL/TLS"),
-        (["cron", "scheduled", "lambda"],                                   "Scheduled Jobs"),
-    ]
-    detected = [label for keywords, label in checks if any(kw in combined for kw in keywords)]
-    return detected if detected else ["General Linux/AWS"]
 
+    def _fmt(v):
+        return f"{v:.2f}" if v is not None else "n/a"
 
-# ═══════════════════════════════════════════════════════════════
-# SECTION 5 — Bedrock Prompt Builder
-# ═══════════════════════════════════════════════════════════════
+    metrics_text = (
+        f"CPU: {_fmt(metrics.get('cpu_percent'))}%  "
+        f"NetIn: {_fmt(metrics.get('network_in_bytes'))} B  "
+        f"NetOut: {_fmt(metrics.get('network_out_bytes'))} B  "
+        f"DiskRd: {_fmt(metrics.get('disk_read_ops'))} ops  "
+        f"DiskWr: {_fmt(metrics.get('disk_write_ops'))} ops  "
+        f"StatusFailed: {_fmt(metrics.get('status_check_failed'))}"
+    )
 
-def _build_prompt(ai_context: dict, stack_hints: list) -> str:
-    stack_str = ", ".join(stack_hints)
-    stack_cli_hints = []
-    if "Docker" in stack_hints:
-        stack_cli_hints.append("docker ps -a, docker logs --tail 300 <container>, docker stats --no-stream")
-    if "Network/ALB" in stack_hints:
-        stack_cli_hints.append("netstat -tulnp, curl localhost health check, aws elbv2 describe-target-health")
-    if "Database (RDS/Postgres/MySQL)" in stack_hints:
-        stack_cli_hints.append("pg_stat_activity queries, slow query analysis, aws rds describe-db-instances")
-    cli_hint_block = "\n".join(stack_cli_hints)
+    dep_text = json.dumps(dependency_ctx, indent=2, default=str) if dependency_ctx else "none"
 
-    return f"""
-You are a Principal AWS Site Reliability Engineer with deep expertise in:
-- AWS infrastructure, EC2 troubleshooting, Docker, ALB / networking
-- Linux production debugging, distributed systems, root cause analysis
+    return f"""You are a Principal AWS Site Reliability Engineer specialising in EC2 production incidents.
 
-Analyze the following production incident carefully.
+═══ INCIDENT ═══
+Event ID  : {event_id}
+Severity  : {severity.upper()}
+Issue     : {issue}
 
-Detected stack:
-{stack_str}
+═══ TIME ANCHOR (how investigation windows were computed) ═══
+{anchor_text}
 
-Relevant troubleshooting commands:
-{cli_hint_block}
+Note: Logs are split into stages so you can reason about the timeline precisely.
+Stage 1 = what was happening BEFORE the first error (build-up / degradation).
+Stage 2 = the active failure window (most likely contains root cause).
+Stage 3 = cascading impact and recovery signals AFTER health check failed.
 
-Incident telemetry:
-{json.dumps(ai_context, indent=2, default=str)}
+═══ EC2 SNAPSHOT ═══
+{ec2_text}
 
-IMPORTANT RESPONSE RULES:
-1. Return ONLY valid JSON
-2. Do NOT use markdown code fences or triple backticks
-3. rca_report must be plain text
-4. remediation_steps must be plain text
-5. Keep all content inside JSON strings
-6. Never return invalid JSON
+═══ CLOUDWATCH METRICS (last 15 min before analysis) ═══
+{metrics_text}
 
-Return EXACTLY this schema:
+═══ TOP ERROR SIGNALS (global, across all log groups) ═══
+{top_errors_text if top_errors_text else "  (none identified)"}
 
+═══ DETAILED LOG ANALYSIS (per group, per stage, deduplicated) ═══
+{log_summary_text}
+
+═══ DEPENDENCY CONTEXT ═══
+{dep_text}
+
+━━━ INSTRUCTIONS ━━━
+Analyse the above EC2 production incident.  Your reasoning should:
+1. Use the stage breakdown to determine WHEN the problem actually started
+   (Stage 1 build-up vs Stage 2 failure — the true start may predate the
+   Pulse detection time).
+2. Correlate error cluster counts and patterns with the CloudWatch metrics.
+3. Identify whether errors in Stage 2 have a single root cause or multiple.
+4. Describe the cascade from Stage 2 → Stage 3 (what broke first, what followed).
+
+Return ONLY valid JSON.  No markdown fences.  No text outside JSON.
+
+Schema:
 {{
-  "root_cause": "technical root cause",
-  "confidence_score": 0.95,
-  "impacted_dependencies": ["service1", "service2"],
-  "prevention_recommendations": "detailed prevention recommendations",
-  "rca_report": "DETAILED RCA REPORT AS SINGLE STRING",
-  "remediation_steps": "DETAILED REMEDIATION STEPS AS SINGLE STRING"
+  "root_cause": "concise technical root cause in 1-2 sentences",
+  "confidence_score": 0.0-1.0,
+  "actual_incident_start": "best estimate of when problem really started (not detection time)",
+  "impacted_services": ["list of affected services or components"],
+  "severity_assessment": "brief blast-radius assessment",
+  "rca_report": "FULL RCA as single plain-text string covering: summary | timeline (use the 3 stages) | metrics analysis | per-group log analysis | root cause | contributing factors",
+  "remediation_steps": "STEP-BY-STEP plain-text: immediate actions | CLI commands to verify | rollback steps | prevention checklist",
+  "prevention_recommendations": "long-term prevention measures"
 }}
-
-The rca_report should include: incident summary, metrics analysis, log analysis,
-EC2 analysis, dependency analysis, detailed technical root cause, contributing
-factors, timeline.
-
-The remediation_steps should include: immediate actions, CLI commands,
-verification steps, rollback steps, prevention checklist.
 """
 
 
-# ═══════════════════════════════════════════════════════════════
-# SECTION 6 — Bedrock Invocation
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — Bedrock Invocation
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def invoke_bedrock_rca(ai_context: dict) -> dict:
-    logger.info(f"Invoking Bedrock model: {BEDROCK_MODEL}")
-    stack_hints = detect_stack(ai_context)
-    logger.info(f"Detected stack: {stack_hints}")
-    prompt = _build_prompt(ai_context, stack_hints)
-
+def _invoke_bedrock(prompt: str) -> dict:
+    logger.info(f"Invoking Bedrock: {BEDROCK_MODEL}")
     bedrock = boto3.client("bedrock-runtime", region_name=REGION)
 
     body = {"prompt": prompt, "max_gen_len": 4096, "temperature": 0.2, "top_p": 0.9}
@@ -353,42 +344,44 @@ def invoke_bedrock_rca(ai_context: dict) -> dict:
     cleaned = re.sub(r"```json|```", "", text).strip()
     start   = cleaned.find("{")
     if start == -1:
-        logger.warning("No JSON object found in Bedrock response")
-        return _fallback_response(text)
-    cleaned = cleaned[start:]
+        logger.warning("No JSON object in Bedrock response")
+        return _fallback_rca(text)
 
+    cleaned = cleaned[start:]
     try:
         decoder = json.JSONDecoder(strict=False)
         parsed, _ = decoder.raw_decode(cleaned)
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parse failed: {e}")
-        return _fallback_response(text)
+        logger.info(f"RCA parsed | confidence: {parsed.get('confidence_score')}")
+        return parsed
+    except json.JSONDecodeError as exc:
+        logger.error(f"JSON parse failed: {exc} | first 500: {cleaned[:500]}")
+        return _fallback_rca(text)
 
-    logger.info(f"RCA parsed — confidence: {parsed.get('confidence_score')}")
-    return parsed
 
-
-def _fallback_response(raw_text: str) -> dict:
+def _fallback_rca(raw_text: str) -> dict:
     return {
-        "root_cause":                 "AI response parsing failed",
+        "root_cause":                 "AI response parsing failed — manual review required",
         "confidence_score":           0.3,
-        "impacted_dependencies":      [],
-        "prevention_recommendations": "Manual review required.",
+        "actual_incident_start":      "unknown",
+        "impacted_services":          [],
+        "severity_assessment":        "Unknown",
         "rca_report":                 raw_text[:3000],
         "remediation_steps": (
-            "1. Check EC2 health\n"
-            "2. Review Docker container logs\n"
-            "3. Verify application connectivity\n"
-            "4. Check CloudWatch logs"
+            "1. Check EC2 instance health in AWS console\n"
+            "2. Review all CloudWatch log groups manually\n"
+            "3. Verify application process is running (systemctl / docker ps)\n"
+            "4. Check disk, memory, and CPU utilisation\n"
+            "5. Inspect security group and network ACL rules"
         ),
+        "prevention_recommendations": "Set up CloudWatch alarms for key metrics.",
     }
 
 
-# ═══════════════════════════════════════════════════════════════
-# SECTION 7 — DB Status Helper
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — DB Helpers
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def update_status(event_id: str, status: str):
+def _update_status(event_id: str, status: str) -> None:
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -399,41 +392,88 @@ def update_status(event_id: str, status: str):
                 """,
                 (status, event_id),
             )
-    logger.info(f"Status updated to '{status}' for event: {event_id}")
+    logger.info(f"Status → '{status}' for {event_id}")
 
 
-# ═══════════════════════════════════════════════════════════════
-# SECTION 8 — Main Entry Point (called by worker)
-# ═══════════════════════════════════════════════════════════════
+def _parse_time(dt_val) -> datetime | None:
+    if not dt_val:
+        return None
+    if isinstance(dt_val, str):
+        return datetime.fromisoformat(dt_val.replace("Z", "+00:00"))
+    if isinstance(dt_val, datetime):
+        return dt_val if dt_val.tzinfo else dt_val.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _parse_log_groups(incident: dict) -> list[str]:
+    """
+    Accept log group names in any format the user might have stored:
+      • JSONB list column   → already a Python list
+      • JSON array string   → '["grp1","grp2"]'
+      • comma-separated     → 'grp1, grp2'
+      • single value        → '/aws/ec2/app'
+    """
+    raw = incident.get("log_group_names") or incident.get("log_group_name") or ""
+
+    if isinstance(raw, list):
+        return [g.strip() for g in raw if str(g).strip()]
+
+    if isinstance(raw, str):
+        s = raw.strip()
+        if s.startswith("["):
+            try:
+                parsed = json.loads(s)
+                return [g.strip() for g in parsed if isinstance(g, str) and g.strip()]
+            except Exception:
+                pass
+        return [g.strip() for g in s.split(",") if g.strip()]
+
+    return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 6 — Main Entry Point
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def process_incident(payload: dict) -> None:
     """
-    Process a single incident payload (equivalent to one SQS record).
-    Runs synchronously in a thread pool worker.
+    Process a single incident.  Called by the worker thread pool.
+
+    payload requires only {"event_id": str}.
+    All other data is read from meyiconnect.incidents (populated by the Pulse
+    webhook when the health check failed and the user triggered RCA via the UI).
+
+    Required DB columns:
+        event_id          — unique incident identifier
+        instance_id       — EC2 instance ID
+        issue             — free-text description (used for adaptive window)
+        severity          — "critical" / "high" / "medium" / "low"
+        region            — AWS region (default ap-south-1)
+        incident_down_time — UTC timestamp when Pulse detected the failure
+        log_group_names   — one or more CW log group names (JSON array / CSV)
+        dependency_context — optional JSON blob
     """
     logger.info("========== INCIDENT PROCESSOR STARTED ==========")
-    logger.info(f"Payload keys: {list(payload.keys())}")
-
     event_id = payload.get("event_id", "unknown")
 
     try:
+        # ── Load incident ──────────────────────────────────────────────────────
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT * FROM meyiconnect.incidents WHERE event_id = %s LIMIT 1",
-                    (event_id,)
+                    (event_id,),
                 )
                 incident = cur.fetchone()
 
         if not incident:
-            logger.error(f"Incident not found in DB for event_id: {event_id}")
+            logger.error(f"Incident not found in DB: {event_id}")
             return
 
-        instance_id    = incident["instance_id"]
-        issue          = incident["issue"]
-        severity       = incident["severity"]
-        log_group_name = incident["log_group_name"]
-        region         = incident.get("region") or "ap-south-1"
+        instance_id = incident["instance_id"]
+        issue       = incident["issue"]       or ""
+        severity    = incident["severity"]    or "medium"
+        region      = incident.get("region")  or "ap-south-1"
 
         dependency_ctx = incident.get("dependency_context") or {}
         if isinstance(dependency_ctx, str):
@@ -442,55 +482,53 @@ def process_incident(payload: dict) -> None:
             except Exception:
                 dependency_ctx = {}
 
-        def _parse_time(dt_val):
-            if not dt_val:
-                return None
-            if isinstance(dt_val, str):
-                return datetime.fromisoformat(dt_val.replace("Z", "+00:00"))
-            if dt_val.tzinfo is None:
-                return dt_val.replace(tzinfo=timezone.utc)
-            return dt_val
+        # incident_down_time is the ONLY time we need — everything else is derived
+        incident_down_time = _parse_time(incident.get("incident_down_time"))
+        if not incident_down_time:
+            # Hard fallback: if somehow not set, use now - 30 min
+            logger.warning("incident_down_time missing — falling back to now-30min")
+            incident_down_time = datetime.now(timezone.utc) - timedelta(minutes=30)
 
-        incident_start = _parse_time(incident["incident_start_time"])
-        incident_end = _parse_time(incident["incident_end_time"])
-        incident_down_time = _parse_time(incident.get("incident_down_time")) or incident_start
+        log_groups = _parse_log_groups(incident)
+        if not log_groups:
+            logger.warning(f"No log groups for event {event_id} — log analysis will be empty")
 
         logger.info(
-            f"Processing event: {event_id} | instance: {instance_id} | "
-            f"region: {region} | down_time: {incident_down_time.isoformat()}"
+            f"Event: {event_id} | instance: {instance_id} | region: {region} | "
+            f"severity: {severity} | down_time: {incident_down_time.isoformat()} | "
+            f"log_groups: {log_groups}"
         )
 
-        local_ec2_client  = boto3.client("ec2",        region_name=region)
-        local_cw_client   = boto3.client("cloudwatch", region_name=region)
-        local_logs_client = boto3.client("logs",       region_name=region)
+        # ── AWS clients ────────────────────────────────────────────────────────
+        ec2_client  = boto3.client("ec2",        region_name=region)
+        cw_client   = boto3.client("cloudwatch", region_name=region)
+        logs_client = boto3.client("logs",       region_name=region)
 
-        # ── Phase 1: Fetch data in parallel ───────────────────────────────────
-        update_status(event_id, "fetching_data")
+        # ── Fetch EC2 details, metrics, and logs in parallel ───────────────────
+        _update_status(event_id, "fetching_data")
 
         with ThreadPoolExecutor(max_workers=3) as pool:
-            f_ec2     = pool.submit(get_ec2_details,  local_ec2_client,  instance_id)
-            f_metrics = pool.submit(get_all_metrics,  local_cw_client,   instance_id)
+            f_ec2     = pool.submit(get_ec2_details, ec2_client,  instance_id)
+            f_metrics = pool.submit(get_all_metrics, cw_client,   instance_id)
             f_logs    = pool.submit(
-                get_incident_logs_optimized,
-                local_logs_client,
-                log_group_name,
-                incident_start,
-                incident_end,
-                incident_down_time,
+                fetch_and_compress_logs,
+                logs_client,
+                log_groups,
+                incident_down_time,   # ← ONLY timestamp needed
+                severity,             # ← for adaptive window
+                issue,                # ← for adaptive window keyword matching
             )
             ec2      = f_ec2.result()
             metrics  = f_metrics.result()
             log_data = f_logs.result()
 
-        context_logs = log_data["context_logs"]
-        top_errors   = log_data["top_errors"]
-        error_events = log_data["error_events"]
-
         logger.info(
-            f"All data fetched — "
-            f"error_events={len(error_events)}, "
-            f"context_logs={len(context_logs)}, "
-            f"top_errors={len(top_errors)}"
+            f"Data fetched | "
+            f"adaptive_window={log_data['adaptive_window']} | "
+            f"anchor={log_data['anchor']} | "
+            f"stages={[s['name'] for s in log_data['stages']]} | "
+            f"error_events={len(log_data['error_events'])} | "
+            f"total_raw={log_data['total_raw_lines']}"
         )
 
         # ── Store raw fetched data ─────────────────────────────────────────────
@@ -510,52 +548,34 @@ def process_incident(payload: dict) -> None:
                         json.dumps(ec2["details"]),
                         json.dumps(ec2["status_checks"]),
                         json.dumps(metrics),
-                        json.dumps(context_logs),
-                        len(context_logs),
+                        json.dumps({                         # store structured summary, not raw lines
+                            "anchor":    log_data["anchor"],
+                            "stages":    log_data["stages"],
+                            "per_group": log_data["per_group"],
+                        }),
+                        log_data["total_raw_lines"],
                     ),
                 )
                 log_id = cur.fetchone()["id"]
 
-        logger.info(f"Raw data stored, log record id: {log_id}")
+        logger.info(f"Data stored | log_id: {log_id}")
 
-        # ── Phase 2: Build AI context ──────────────────────────────────────────
-        update_status(event_id, "finding_rca")
+        # ── Build Bedrock prompt ───────────────────────────────────────────────
+        _update_status(event_id, "finding_rca")
 
-        ai_context = {
-            "incident": {
-                "event_id":            event_id,
-                "issue":               issue,
-                "severity":            severity,
-                "incident_start_time": incident_start.isoformat() if incident_start else None,
-                "incident_end_time":   incident_end.isoformat() if incident_end else None,
-                "incident_down_time":  incident_down_time.isoformat() if incident_down_time else None,
-            },
-            "ec2": {
-                "details":       ec2["details"],
-                "status_checks": ec2["status_checks"],
-            },
-            "metrics": {
-                "cpu_percent":         metrics.get("cpu_percent"),
-                "network_in_bytes":    metrics.get("network_in_bytes"),
-                "network_out_bytes":   metrics.get("network_out_bytes"),
-                "disk_read_ops":       metrics.get("disk_read_ops"),
-                "disk_write_ops":      metrics.get("disk_write_ops"),
-                "status_check_failed": metrics.get("status_check_failed"),
-            },
-            "logs": {
-                "total_count": len(context_logs),
-                "error_count": len(error_events),
-                "top_errors":  top_errors,
-                "logs":        context_logs,
-            },
-            "dependency_context": {
-                **dependency_ctx,
-                "log_group_name": log_group_name,
-            },
-        }
+        prompt = _build_prompt(
+            event_id       = event_id,
+            issue          = issue,
+            severity       = severity,
+            down_time_iso  = incident_down_time.isoformat(),
+            ec2            = ec2,
+            metrics        = metrics,
+            log_data       = log_data,
+            dependency_ctx = dependency_ctx,
+        )
 
-        # ── Phase 3: Call Bedrock ──────────────────────────────────────────────
-        rca = invoke_bedrock_rca(ai_context)
+        # ── Invoke Bedrock ─────────────────────────────────────────────────────
+        rca = _invoke_bedrock(prompt)
 
         # ── Store RCA ──────────────────────────────────────────────────────────
         with get_db() as conn:
@@ -575,17 +595,20 @@ def process_incident(payload: dict) -> None:
                         rca.get("remediation_steps", ""),
                         float(rca.get("confidence_score", 0.5)),
                         BEDROCK_MODEL,
-                        json.dumps(rca.get("impacted_dependencies", [])),
+                        json.dumps(
+                            rca.get("impacted_services")
+                            or rca.get("impacted_dependencies", [])
+                        ),
                     ),
                 )
 
-        update_status(event_id, "completed")
+        _update_status(event_id, "completed")
         logger.info(f"========== EVENT COMPLETED: {event_id} ==========")
 
-    except Exception as e:
+    except Exception:
         logger.exception(f"Processing failed for event: {event_id}")
         try:
-            update_status(event_id, "failed")
+            _update_status(event_id, "failed")
         except Exception:
             logger.exception("Failed to update status to failed")
         raise
