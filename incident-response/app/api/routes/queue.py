@@ -25,7 +25,7 @@ router = APIRouter()
 # ── Request schema ─────────────────────────────────────────────────────────────
 
 class EnqueueRequest(BaseModel):
-    event_id:            str
+    incident_id:            str
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -40,13 +40,13 @@ async def enqueue(body: EnqueueRequest):
     run EC2 + CloudWatch + Bedrock analysis, and store results in the DB.
     """
     payload = {
-        "event_id": body.event_id
+        "incident_id": body.incident_id
     }
     await queue_manager.enqueue(payload)
-    logger.info(f"[/queue/enqueue] event_id={body.event_id} accepted")
+    logger.info(f"[/queue/enqueue] incident_id={body.incident_id} accepted")
     return {
         "accepted": True,
-        "event_id": body.event_id,
+        "incident_id": body.incident_id,
         "queue_position": queue_manager.size,
         "message": "Incident queued for RCA processing.",
     }

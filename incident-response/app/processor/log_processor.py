@@ -69,7 +69,15 @@ MAX_REPEAT_SHOW         = 3     # sample copies per cluster
 # ─── Error keyword regex ───────────────────────────────────────────────────────
 ERROR_PATTERN = re.compile(
     r"error|exception|fatal|critical|fail|traceback|panic|oom|killed|"
-    r"segfault|refused|timeout|unavailable|500|502|503|504",
+    r"segfault|refused|timeout|unavailable|"
+    r"\b500\b|\b502\b|\b503\b|\b504\b", 
+    re.IGNORECASE,
+)
+
+# ─── Noise filter — infra/OS chatter that drowns out real app failures ─────────
+IGNORE_PATTERNS = re.compile(
+    r"systemd\[|kernel:|BOOT_IMAGE|system-modprobe|"
+    r"cloud-init|cron\[|session opened|session closed",
     re.IGNORECASE,
 )
 
@@ -110,11 +118,11 @@ _WEIGHT_RULES: list[tuple[re.Pattern, int, str]] = [
     (re.compile(r"oom|out.of.memory(?!.kill)",                              re.I),  50, "oom-warn"),
     (re.compile(r"refused|econnrefused|connection.?refused",                re.I),  45, "conn-refused"),
     (re.compile(r"unavailable|service.?unavailable",                        re.I),  40, "unavailable"),
-    (re.compile(r"500|internal.server.error",                               re.I),  35, "http-500"),
-    (re.compile(r"502|bad.gateway",                                         re.I),  30, "http-502"),
-    (re.compile(r"503|service.temporarily.unavailable",                     re.I),  30, "http-503"),
+    (re.compile(r"\b500\b|internal.server.error",                           re.I),  35, "http-500"),
+    (re.compile(r"\b502\b|bad.gateway",                                     re.I),  30, "http-502"),
+    (re.compile(r"\b503\b|service.temporarily.unavailable",                 re.I),  30, "http-503"),
     (re.compile(r"timeout|timed.out|deadline.exceeded",                     re.I),  25, "timeout"),
-    (re.compile(r"504|gateway.timeout",                                     re.I),  20, "http-504"),
+    (re.compile(r"\b504\b|gateway.timeout",                                 re.I),  20, "http-504"),
     (re.compile(r"error",                                                   re.I),  15, "generic-error"),
     (re.compile(r"warn|warning",                                            re.I),   5, "warning"),
     (re.compile(r"fail",                                                    re.I),   8, "fail"),
@@ -284,6 +292,7 @@ def _fetch_paginated(logs_client, log_group: str,
             break
 
     logger.info(f"[CW] {log_group}: {len(collected)} events in {page} page(s)")
+    collected.sort(key=lambda e: e["ts"])
     return collected
 
 
@@ -347,8 +356,11 @@ def _run_phase_a(logs_client, log_groups: list[str],
         )
         errors = []
         for e in events:
-            if ERROR_PATTERN.search(e["message"]):
-                weight, wlabel = _severity_weight(e["message"])
+            msg = e["message"]
+            if IGNORE_PATTERNS.search(msg):
+                continue
+            if ERROR_PATTERN.search(msg):
+                weight, wlabel = _severity_weight(msg)
                 e["log_group"]      = lg
                 e["weight"]         = weight
                 e["weight_label"]   = wlabel

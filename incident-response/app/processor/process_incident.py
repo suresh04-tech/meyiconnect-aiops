@@ -25,6 +25,7 @@ import json
 import boto3
 import logging
 import re
+from botocore.config import Config
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -222,7 +223,7 @@ def _format_log_summary_for_prompt(log_data: dict) -> str:
 
 
 def _build_prompt(
-    event_id:           str,
+    incident_id:        str,
     issue:              str,
     severity:           str,
     down_time_iso:      str,
@@ -270,7 +271,7 @@ def _build_prompt(
     return f"""You are a Principal AWS Site Reliability Engineer specialising in EC2 production incidents.
 
 ═══ INCIDENT ═══
-Event ID  : {event_id}
+Event ID  : {incident_id}
 Severity  : {severity.upper()}
 Issue     : {issue}
 
@@ -306,7 +307,24 @@ Analyse the above EC2 production incident.  Your reasoning should:
 3. Identify whether errors in Stage 2 have a single root cause or multiple.
 4. Describe the cascade from Stage 2 → Stage 3 (what broke first, what followed).
 
-Return ONLY valid JSON.  No markdown fences.  No text outside JSON.
+IMPORTANT:
+You MUST return ONLY a valid JSON object.
+
+Do NOT:
+- add markdown
+- add explanations
+- add comments
+- add ```json fences
+- add text before or after JSON
+
+Your ENTIRE response must:
+- start with {{
+- end with }}
+
+If information is missing, use:
+"unknown"
+
+The response MUST be parseable by Python json.loads().
 
 Schema:
 {{
@@ -345,12 +363,13 @@ def _invoke_bedrock(prompt: str) -> dict:
     )
 
     cleaned = re.sub(r"```json|```", "", text).strip()
-    start   = cleaned.find("{")
-    if start == -1:
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if not match:
         logger.warning("No JSON object in Bedrock response")
+        logger.debug(f"[Raw Bedrock Output]\n{text}")
         return _fallback_rca(text)
 
-    cleaned = cleaned[start:]
+    cleaned = match.group(0)
     try:
         decoder = json.JSONDecoder(strict=False)
         parsed, _ = decoder.raw_decode(cleaned)
@@ -384,18 +403,18 @@ def _fallback_rca(raw_text: str) -> dict:
 # SECTION 5 — DB Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _update_status(event_id: str, status: str) -> None:
+def _update_status(incident_id: str, status: str) -> None:
     with get_db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 UPDATE meyiconnect.incidents
                 SET status = %s, updated_at = NOW()
-                WHERE event_id = %s
+                WHERE incident_id = %s
                 """,
-                (status, event_id),
+                (status, incident_id),
             )
-    logger.info(f"Status → '{status}' for {event_id}")
+    logger.info(f"Status → '{status}' for {incident_id}")
 
 
 def _parse_time(dt_val) -> datetime | None:
@@ -442,12 +461,12 @@ def process_incident(payload: dict) -> None:
     """
     Process a single incident.  Called by the worker thread pool.
 
-    payload requires only {"event_id": str}.
+    payload requires only {"incident_id": str}.
     All other data is read from meyiconnect.incidents (populated by the Pulse
     webhook when the health check failed and the user triggered RCA via the UI).
 
     Required DB columns:
-        event_id          — unique incident identifier
+        incident_id       — unique incident identifier
         instance_id       — EC2 instance ID
         issue             — free-text description (used for adaptive window)
         severity          — "critical" / "high" / "medium" / "low"
@@ -457,20 +476,20 @@ def process_incident(payload: dict) -> None:
         dependency_context — optional JSON blob
     """
     logger.info("========== INCIDENT PROCESSOR STARTED ==========")
-    event_id = payload.get("event_id", "unknown")
+    incident_id = payload.get("incident_id", "unknown")
 
     try:
         # ── Load incident ──────────────────────────────────────────────────────
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT * FROM meyiconnect.incidents WHERE event_id = %s LIMIT 1",
-                    (event_id,),
+                    "SELECT * FROM meyiconnect.incidents WHERE incident_id = %s LIMIT 1",
+                    (incident_id,),
                 )
                 incident = cur.fetchone()
 
         if not incident:
-            logger.error(f"Incident not found in DB: {event_id}")
+            logger.error(f"Incident not found in DB: {incident_id}")
             return
 
         instance_id = incident["instance_id"]
@@ -494,21 +513,22 @@ def process_incident(payload: dict) -> None:
 
         log_groups = _parse_log_groups(incident)
         if not log_groups:
-            logger.warning(f"No log groups for event {event_id} — log analysis will be empty")
+            logger.warning(f"No log groups for incident {incident_id} — log analysis will be empty")
 
         logger.info(
-            f"Event: {event_id} | instance: {instance_id} | region: {region} | "
+            f"Event: {incident_id} | instance: {instance_id} | region: {region} | "
             f"severity: {severity} | down_time: {incident_down_time.isoformat()} | "
             f"log_groups: {log_groups}"
         )
 
-        # ── AWS clients ────────────────────────────────────────────────────────
+        # ── AWS clients ──────────────────────────────────────────────────────────────
+        boto_config = Config(max_pool_connections=50)
         ec2_client  = boto3.client("ec2",        region_name=region)
         cw_client   = boto3.client("cloudwatch", region_name=region)
-        logs_client = boto3.client("logs",       region_name=region)
+        logs_client = boto3.client("logs",       region_name=region, config=boto_config)
 
         # ── Fetch EC2 details, metrics, and logs in parallel ───────────────────
-        _update_status(event_id, "fetching_data")
+        _update_status(incident_id, "fetching_data")
 
         with ThreadPoolExecutor(max_workers=3) as pool:
             f_ec2     = pool.submit(get_ec2_details, ec2_client,  instance_id)
@@ -525,6 +545,12 @@ def process_incident(payload: dict) -> None:
             metrics  = f_metrics.result()
             log_data = f_logs.result()
 
+        if log_data["total_raw_lines"] == 0:
+            logger.warning(
+                "[RCA Warning] "
+                "No CloudWatch logs retrieved for investigation window"
+            )
+
         logger.info(
             f"Data fetched | "
             f"adaptive_window={log_data['adaptive_window']} | "
@@ -540,14 +566,14 @@ def process_incident(payload: dict) -> None:
                 cur.execute(
                     """
                     INSERT INTO meyiconnect.incident_logs (
-                        event_id, ec2_details, ec2_status_checks,
+                        incident_id, ec2_details, ec2_status_checks,
                         cloudwatch_metrics, raw_logs, logs_count
                     )
                     VALUES (%s, %s, %s, %s, %s, %s)
                     RETURNING id
                     """,
                     (
-                        event_id,
+                        incident_id,
                         json.dumps(ec2["details"]),
                         json.dumps(ec2["status_checks"]),
                         json.dumps(metrics),
@@ -564,10 +590,10 @@ def process_incident(payload: dict) -> None:
         logger.info(f"Data stored | log_id: {log_id}")
 
         # ── Build Bedrock prompt ───────────────────────────────────────────────
-        _update_status(event_id, "finding_rca")
+        _update_status(incident_id, "finding_rca")
 
         prompt = _build_prompt(
-            event_id       = event_id,
+            incident_id       = incident_id,
             issue          = issue,
             severity       = severity,
             down_time_iso  = incident_down_time.isoformat(),
@@ -579,6 +605,12 @@ def process_incident(payload: dict) -> None:
 
         # ── Invoke Bedrock ─────────────────────────────────────────────────────
         estimated_tokens = len(prompt) // 4
+
+        if estimated_tokens > 25000:
+            logger.warning(
+                f"[Prompt Size Warning] "
+                f"Large prompt detected: ~{estimated_tokens} tokens"
+            )
 
         logger.info(
             f"[Bedrock Prompt] "
@@ -593,20 +625,26 @@ def process_incident(payload: dict) -> None:
         )
         rca = _invoke_bedrock(prompt)
 
+        logger.info(
+            f"[RCA Summary] "
+            f"confidence={rca.get('confidence_score')} | "
+            f"root_cause={rca.get('root_cause', '')[:300]}"
+        )
+
         # ── Store RCA ──────────────────────────────────────────────────────────
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO meyiconnect.incident_rca (
-                        event_id, rca_report, remediation_steps,
+                        incident_id, rca_report, remediation_steps,
                         confidence_score, ai_model_used,
                         impacted_dependencies, processing_status
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, 'completed')
                     """,
                     (
-                        event_id,
+                        incident_id,
                         rca.get("rca_report", ""),
                         rca.get("remediation_steps", ""),
                         float(rca.get("confidence_score", 0.5)),
@@ -618,13 +656,13 @@ def process_incident(payload: dict) -> None:
                     ),
                 )
 
-        _update_status(event_id, "completed")
-        logger.info(f"========== EVENT COMPLETED: {event_id} ==========")
+        _update_status(incident_id, "completed")
+        logger.info(f"========== EVENT COMPLETED: {incident_id} ==========")
 
     except Exception:
-        logger.exception(f"Processing failed for event: {event_id}")
+        logger.exception(f"Processing failed for event: {incident_id}")
         try:
-            _update_status(event_id, "failed")
+            _update_status(incident_id, "failed")
         except Exception:
             logger.exception("Failed to update status to failed")
         raise
