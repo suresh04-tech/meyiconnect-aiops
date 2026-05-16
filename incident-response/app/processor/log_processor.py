@@ -873,6 +873,15 @@ def fetch_and_compress_logs(
 
     # ── Phase C ────────────────────────────────────────────────────────────────
     stages          = _build_stages(anchor, incident_down_time)
+    logger.info(
+        "[Timeline Stages]\n" +
+        "\n".join(
+            f"  {s['name']}: "
+            f"{s['start'].strftime('%H:%M:%S')} → "
+            f"{s['end'].strftime('%H:%M:%S')}"
+            for s in stages
+        )
+    )
     phase_c_results = _run_phase_c(logs_client, log_groups, stages)
 
     # ── Phase D + E ────────────────────────────────────────────────────────────
@@ -931,6 +940,11 @@ def fetch_and_compress_logs(
         top_errors.append(" ".join(p for p in parts if p))
         if len(top_errors) >= 10:
             break
+
+    logger.info(
+        "[Top Error Signals]\n" +
+        "\n".join(f"  • {e}" for e in top_errors[:10])
+    )
 
     # Serialise anchor datetimes
     serialised_anchor = {

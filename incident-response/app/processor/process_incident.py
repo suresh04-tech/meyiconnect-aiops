@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.utils.db import get_db
-from processor.log_processor import fetch_and_compress_logs
+from app.processor.log_processor import fetch_and_compress_logs
 
 logger = logging.getLogger(__name__)
 
@@ -340,6 +340,9 @@ def _invoke_bedrock(prompt: str) -> dict:
     raw  = json.loads(resp["body"].read())
     text = raw.get("generation", raw.get("content", [{}])[0].get("text", ""))
     logger.info("Bedrock response received — parsing...")
+    logger.debug(
+        f"[Bedrock Raw Response]\n{text[:8000]}"
+    )
 
     cleaned = re.sub(r"```json|```", "", text).strip()
     start   = cleaned.find("{")
@@ -575,6 +578,19 @@ def process_incident(payload: dict) -> None:
         )
 
         # ── Invoke Bedrock ─────────────────────────────────────────────────────
+        estimated_tokens = len(prompt) // 4
+
+        logger.info(
+            f"[Bedrock Prompt] "
+            f"chars={len(prompt)} | "
+            f"estimated_tokens={estimated_tokens} | "
+            f"top_errors={len(log_data.get('top_errors', []))} | "
+            f"groups={len(log_data.get('per_group', {}))}"
+        )
+
+        logger.debug(
+            f"[Bedrock Prompt Preview]\n{prompt[:8000]}"
+        )
         rca = _invoke_bedrock(prompt)
 
         # ── Store RCA ──────────────────────────────────────────────────────────
