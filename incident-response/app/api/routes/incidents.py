@@ -58,14 +58,16 @@ ERROR_PATTERN = re.compile(
 # ── Pydantic models ────────────────────────────────────────────────────────────
 
 class CreateIncidentRequest(BaseModel):
-    instance_id:          str
-    issue:                str
-    severity:             str
-    incident_start_time:  str = Field(..., description="ISO 8601")
-    incident_end_time:    str = Field(..., description="ISO 8601")
-    log_group_name:       str
-    region:               str = "ap-south-1"
-    dependency_context:   dict[str, Any] = {}
+    instance_id: str
+    severity: str = "low"
+    incident_down_time: str = Field(..., description="ISO 8601")
+    log_group_name: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Minimum one CloudWatch log group required"
+    )
+    region: str = "ap-south-1"
+    dependency_context: dict[str, Any] | None = None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -73,20 +75,19 @@ class CreateIncidentRequest(BaseModel):
 def _validate_create(body: CreateIncidentRequest) -> str | None:
     if not body.instance_id.strip():
         return "instance_id is required"
-    if not body.issue.strip():
-        return "issue is required"
     if body.severity not in VALID_SEVERITIES:
         return f"severity must be one of: {', '.join(VALID_SEVERITIES)}"
     try:
-        datetime.fromisoformat(body.incident_start_time.replace("Z", "+00:00"))
+        datetime.fromisoformat(
+            body.incident_down_time.replace("Z", "+00:00")
+        )
     except (ValueError, AttributeError):
-        return "incident_start_time must be a valid ISO 8601 datetime"
-    try:
-        datetime.fromisoformat(body.incident_end_time.replace("Z", "+00:00"))
-    except (ValueError, AttributeError):
-        return "incident_end_time must be a valid ISO 8601 datetime"
-    if not body.log_group_name.strip():
-        return "log_group_name is required"
+        return "incident_down_time must be valid ISO 8601"
+    if not body.log_group_name:
+        return "At least one log group is required"
+    for log_group in body.log_group_name:
+        if not log_group.strip():
+            return "Invalid log group name"
     return None
 
 
@@ -137,22 +138,24 @@ async def create_incident(body: CreateIncidentRequest):
                 cur.execute(
                     """
                     INSERT INTO meyiconnect.incidents (
-                        instance_id, issue, severity,
-                        incident_start_time, incident_end_time, region, log_group_name,
-                        dependency_context, status
+                        instance_id,
+                        severity,
+                        incident_down_time,
+                        region,
+                        log_group_name,
+                        dependency_context,
+                        status
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'queued')
+                    VALUES (%s, %s, %s, %s, %s, %s, 'queued')
                     RETURNING event_id, created_at
                     """,
                     (
                         body.instance_id.strip(),
-                        body.issue.strip(),
                         body.severity,
-                        body.incident_start_time,
-                        body.incident_end_time,
+                        body.incident_down_time,
                         body.region.strip() or "ap-south-1",
-                        body.log_group_name.strip(),
-                        json.dumps(body.dependency_context),
+                        body.log_group_name,
+                        json.dumps(body.dependency_context or {}),
                     ),
                 )
                 row = cur.fetchone()
@@ -163,15 +166,13 @@ async def create_incident(body: CreateIncidentRequest):
 
         # ── Enqueue to internal queue (replaces SQS send_message) ─────────────
         queue_payload = {
-            "event_id":            event_id,
-            "instance_id":         body.instance_id.strip(),
-            "issue":               body.issue.strip(),
-            "severity":            body.severity,
-            "incident_start_time": body.incident_start_time,
-            "incident_end_time":   body.incident_end_time,
-            "region":              body.region.strip() or "ap-south-1",
-            "log_group_name":      body.log_group_name.strip(),
-            "dependency_context":  body.dependency_context,
+            "event_id": event_id,
+            "instance_id": body.instance_id.strip(),
+            "severity": body.severity,
+            "incident_down_time": body.incident_down_time,
+            "region": body.region.strip() or "ap-south-1",
+            "log_group_name": body.log_group_name,
+            "dependency_context": body.dependency_context or {},
         }
         await queue_manager.enqueue(queue_payload)
         logger.info(f"Enqueued to internal queue: {event_id}")
@@ -227,8 +228,8 @@ async def list_incidents(
                 cur.execute(
                     """
                     SELECT
-                        i.event_id, i.instance_id, i.issue, i.severity, i.status,
-                        i.incident_start_time, i.created_at, i.updated_at,
+                        i.event_id, i.instance_id, i.severity, i.status,
+                        i.incident_down_time, i.created_at, i.updated_at,
                         r.processing_status AS rca_processing_status,
                         r.confidence_score, r.ai_model_used,
                         r.generated_at      AS rca_generated_at
@@ -243,8 +244,7 @@ async def list_incidents(
 
         incidents = []
         for row in rows:
-            issue = row["issue"] or ""
-            title = issue[:100] + "..." if len(issue) > 100 else issue
+            title = f"Incident detected on {row['instance_id']}"
             score = row["confidence_score"]
             incidents.append({
                 "event_id":            str(row["event_id"]),
