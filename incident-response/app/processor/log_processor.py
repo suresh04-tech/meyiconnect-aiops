@@ -445,15 +445,16 @@ def _anchor_true_start(phase_a_results: dict, down_time: datetime,
 
     logger.info(
         f"[Phase-B] First error: {first_dt.strftime('%H:%M:%S')} "
-        f"in {earliest['log_group']} | "
+        f"in {anchor_error['log_group']} | "
         f"true_start anchored → {true_start.strftime('%H:%M:%S')}"
     )
 
     return {
-        "first_error_ts":    first_dt,
-        "first_error_msg":   earliest["message"][:200],
-        "first_error_group": earliest["log_group"],
-        "true_start":        true_start,
+        "first_error_ts":     first_dt,
+        "first_error_msg":    anchor_error["message"][:200],
+        "first_error_group":  anchor_error["log_group"],
+        "first_error_weight": anchor_error.get("weight", 0),
+        "true_start":         true_start,
     }
 
 
@@ -872,7 +873,7 @@ def fetch_and_compress_logs(
     anchor = _anchor_true_start(phase_a_results, incident_down_time, scan_start)
 
     # ── Phase C ────────────────────────────────────────────────────────────────
-    stages          = _build_stages(anchor, incident_down_time)
+    stages = _build_stages(anchor, incident_down_time)
     logger.info(
         "[Timeline Stages]\n" +
         "\n".join(
