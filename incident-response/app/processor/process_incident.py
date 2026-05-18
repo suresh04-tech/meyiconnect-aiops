@@ -684,8 +684,6 @@ def process_incident(payload: dict) -> None:
             f"root_cause={rca.get('root_cause', '')[:300]}"
         )
 
-        # ── Update RCA ──────────────────────────────────────────────────────────
-        _update_status(incident_id, "storing_results")
         with get_db() as conn:
             with conn.cursor() as cur:
                 confidence_percentage = round(
@@ -693,34 +691,42 @@ def process_incident(payload: dict) -> None:
                     2
                 )
 
+                rca_report_val = rca.get("rca_report", {})
+                if isinstance(rca_report_val, dict):
+                    rca_report_val = json.dumps(rca_report_val)
+                    
+                remediation_val = rca.get("remediation_steps", {})
+                if isinstance(remediation_val, dict):
+                    remediation_val = json.dumps(remediation_val)
+
                 cur.execute(
                     """
                     UPDATE meyiconnect.insight_incidents
                     SET
-                        rca_report = %s,
+                        analysis_status = 'completed',
+                        analysis_percent = 100,
+                        analysis_result = %s,
                         remediation_steps = %s,
                         confidence_score = %s,
                         ai_model_used = %s,
-                        impacted_dependencies = %s,
-                        processing_status = 'completed',
+                        analysis_completed_at = NOW(),
                         updated_at = NOW()
                     WHERE id = %s
                     """,
                     (
-                        rca.get("rca_report", ""),
-                        rca.get("remediation_steps", ""),
-                        confidence_percentage,
+                        rca_report_val,
+                        remediation_val,
+                        str(confidence_percentage),
                         BEDROCK_MODEL,
-                        json.dumps(
-                            rca.get("impacted_services")
-                            or rca.get("impacted_dependencies", [])
-                        ),
                         incident_id,
                     ),
                 )
+                
+                logger.info(f"Rows updated: {cur.rowcount}")
 
-            _update_status(incident_id, "completed")
-            logger.info(f"========== EVENT COMPLETED: {incident_id} ==========")
+            conn.commit()
+            
+        logger.info(f"========== EVENT COMPLETED: {incident_id} ==========")
 
     except Exception:
         logger.exception(f"Processing failed for event: {incident_id}")
