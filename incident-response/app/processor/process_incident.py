@@ -333,8 +333,31 @@ Schema:
   "actual_incident_start": "best estimate of when problem really started (not detection time)",
   "impacted_services": ["list of affected services or components"],
   "severity_assessment": "brief blast-radius assessment",
-  "rca_report": "FULL RCA as single plain-text string covering: summary | timeline (use the 3 stages) | metrics analysis | per-group log analysis | root cause | contributing factors",
-  "remediation_steps": "STEP-BY-STEP plain-text: immediate actions | CLI commands to verify | rollback steps | prevention checklist",
+   "rca_report": {
+        "summary": "",
+        "timeline": {
+        "buildup": "",
+        "failure": "",
+        "impact": ""
+        },
+        "metrics_analysis": "",
+        "infra_change_analysis": "",
+        "log_analysis": {
+        "application": "",
+        "nginx": "",
+        "system": "",
+        "database": ""
+        },
+        "root_cause_analysis": "",
+        "contributing_factors": [],
+        "blast_radius": ""
+    },
+  "remediation_steps": {
+    "immediate_actions": [],
+    "verification_steps": [],
+    "rollback_steps": [],
+    "communication_template": ""
+   },
   "prevention_recommendations": "long-term prevention measures"
 }}
 """
