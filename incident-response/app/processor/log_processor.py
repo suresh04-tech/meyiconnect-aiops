@@ -271,7 +271,7 @@ def _fetch_paginated(logs_client, log_group: str,
                 if e.get("message"):
                     collected.append({"ts": e["timestamp"], "message": e["message"]})
 
-            logger.debug(
+            logger.info(
                 f"[CW page {page}] {log_group}: +{len(events)} events "
                 f"(total so far: {len(collected)})"
             )

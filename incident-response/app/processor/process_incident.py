@@ -371,7 +371,7 @@ def _invoke_bedrock(prompt: str) -> dict:
     text = raw["content"][0]["text"]
     # text = raw.get("generation", raw.get("content", [{}])[0].get("text", ""))
     logger.info("Bedrock response received — parsing...")
-    logger.debug(
+    logger.info(
         f"[Bedrock Raw Response]\n{text[:8000]}"
     )
 
@@ -379,7 +379,7 @@ def _invoke_bedrock(prompt: str) -> dict:
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if not match:
         logger.warning("No JSON object in Bedrock response")
-        logger.debug(f"[Raw Bedrock Output]\n{text}")
+        logger.info(f"[Raw Bedrock Output]\n{text}")
         return _fallback_rca(text)
 
     cleaned = match.group(0)
@@ -644,7 +644,7 @@ def process_incident(payload: dict) -> None:
             f"groups={len(log_data.get('per_group', {}))}"
         )
 
-        logger.debug(
+        logger.info(
             f"[Bedrock Prompt Preview]\n{prompt[:8000]}"
         )
         rca = _invoke_bedrock(prompt)
