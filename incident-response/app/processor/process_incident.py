@@ -431,7 +431,13 @@ def _fallback_rca(raw_text: str) -> dict:
             "4. Check disk, memory, and CPU utilisation\n"
             "5. Inspect security group and network ACL rules"
         ),
-        "prevention_recommendations": "Set up CloudWatch alarms for key metrics.",
+        "prevention_recommendations": {
+            "monitoring": [],
+            "security": [],
+            "infrastructure": [],
+            "application": [],  
+            "operational": []
+        }
     }
 
 
