@@ -469,7 +469,7 @@ def _update_status(incident_id: str, status: str) -> None:
                 """
                 UPDATE meyiconnect.insight_incidents
                 SET analysis_status = %s,
-                    progress_percent = %s,
+                    analysis_percent = %s,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
