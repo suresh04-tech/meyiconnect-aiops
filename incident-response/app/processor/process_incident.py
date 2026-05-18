@@ -336,14 +336,46 @@ Flags:
 You have four data sources: CloudTrail events, CloudWatch log stages, EC2 metrics,
 and service dependency context.  Use ALL of them together.
 
-STEP 1 — INFRA vs APP DETERMINATION
-  Look at the infra hypotheses above.
-  • If a high-risk infra event (risk >= 8) occurred within 10 min of the first log error:
-    → The root cause is INFRA-TRIGGERED.  The log errors are consequences.
-    → Identify the specific API call, the user who made it, and the resource affected.
-  • If NO infra changes correlate with the first error:
-    → The root cause is APPLICATION-SIDE (code bug, resource exhaustion, dependency failure).
-    → Use Stage 1 build-up patterns to find the earliest signal.
+STEP 1 — DETERMINE TRUE ROOT CAUSE
+
+Infrastructure events are correlation signals, NOT proof of causation.
+
+You MUST verify infra hypotheses using application logs, metrics,
+and affected subsystem evidence.
+
+DO NOT conclude infra_triggered unless ALL are true:
+1. The infra event directly affects the failing subsystem
+   (DB, network, IAM, EC2, load balancer, storage, etc.)
+2. The first application/log errors explicitly support the infra hypothesis
+3. No stronger application-level root cause exists
+
+Examples:
+- Security group ingress/egress revoke + DB timeout
+  → infra_triggered
+
+- RDS reboot/failover + connection refused
+  → infra_triggered
+
+- ECS deployment + startup failures
+  → infra_triggered
+
+- IAM AccessDenied exceptions in logs
+  → infra_triggered
+
+But:
+- Generic application exceptions WITHOUT matching infra evidence
+  → app_triggered
+
+- Application stack traces BEFORE downstream failures
+  → app_triggered
+
+- PostgreSQL timeout after SG/network change
+  → dependency_failure or infra_triggered(network)
+
+If evidence is weak or ambiguous:
+- prefer "dependency_failure" or "unknown"
+- NEVER invent services not present in logs/evidence
+- NEVER assume ECS/Lambda/CodePipeline unless explicitly seen in evidence
 
 STEP 2 — WHY DID IT HAPPEN
   • For infra-triggered: Was it intentional (deployment) or accidental (wrong resource)?
@@ -384,6 +416,8 @@ Your ENTIRE response must:
 If information is missing, use "unknown".
 The response MUST be parseable by Python json.loads().
 
+
+
 Schema:
 {{
   "root_cause_type": "infra_triggered | app_triggered | resource_exhaustion | dependency_failure | unknown",
@@ -402,9 +436,32 @@ Schema:
 
   "severity_assessment": "brief blast-radius: which systems, how many users, estimated duration",
 
-  "rca_report": "FULL RCA as single plain-text string covering: SUMMARY | TIMELINE (use 3 stages) | METRICS ANALYSIS | INFRA CHANGE ANALYSIS | PER-GROUP LOG ANALYSIS | ROOT CAUSE (with who/what/when) | CONTRIBUTING FACTORS | BLAST RADIUS",
+   "rca_report": {
+        "summary": "",
+        "timeline": {
+        "buildup": "",
+        "failure": "",
+        "impact": ""
+        },
+        "metrics_analysis": "",
+        "infra_change_analysis": "",
+        "log_analysis": {
+        "application": "",
+        "nginx": "",
+        "system": "",
+        "database": ""
+        },
+        "root_cause_analysis": "",
+        "contributing_factors": [],
+        "blast_radius": ""
+    },
 
-  "remediation_steps": "STEP-BY-STEP plain-text: IMMEDIATE ACTIONS (with AWS CLI commands) | VERIFICATION STEPS | ROLLBACK STEPS | COMMUNICATION TEMPLATE",
+  "remediation_steps": {
+    "immediate_actions": [],
+    "verification_steps": [],
+    "rollback_steps": [],
+    "communication_template": ""
+   },
 
   "prevention_recommendations": "LONG-TERM: specific CloudWatch alarms to add | IAM/change-control guardrails | architectural changes | monitoring gaps to close"
 }}
