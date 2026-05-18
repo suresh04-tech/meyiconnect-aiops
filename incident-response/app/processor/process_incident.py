@@ -5,19 +5,30 @@ Core RCA processing logic — called by the worker thread pool.
 
 What's changed from previous version
 ──────────────────────────────────────
-• Only incident_down_time is required from DB.  incident_start_time and
-  incident_end_time are no longer used — the log_processor derives smarter
-  windows automatically using adaptive lookback + first-error anchoring.
+• CloudTrail infra context is now fetched as a first-class data source alongside
+  CloudWatch logs.  This gives the AI both sides: infra changes AND app errors.
 
-• severity and issue are forwarded to log_processor so the adaptive window
-  calculator can decide the correct lookback (e.g. 60 min for critical/OOM).
+• fetch_infra_context() runs in parallel with EC2 details + metrics so it adds
+  almost zero latency to the pipeline.
 
-• The Bedrock prompt is now stage-aware: it shows the three-stage labelled
-  timeline (buildup / failure / impact) so the model can reason about when
-  the problem started vs when it was detected.
+• _build_prompt() now receives infra_ctx and surfaces:
+    – High-risk infra events ranked by proximity to the first error
+    – Infra-side root cause hypotheses ("DeregisterTargets 3m before first error")
+    – Failed API calls that may have broken something silently
+    – "Who did what" change attribution
 
-• Multi-log-group support: log_group_names column (JSON array, CSV, or single
-  value) is parsed and all groups are processed in parallel.
+• The Bedrock prompt instructions are rewritten to explicitly cross-reference
+  the infra timeline against the log stage breakdown, so the model answers:
+    1. Root cause (infra change vs app bug vs resource exhaustion)
+    2. Why it happened (what change / condition triggered it)
+    3. Who triggered it (CloudTrail actor)
+    4. How to fix it (immediate + long-term)
+    5. How to prevent it (alarms, guards, review process)
+
+Pipeline status steps (visible in UI):
+  queued → fetching_ec2 → fetching_metrics → fetching_logs →
+  fetching_infra → compressing_logs → building_prompt →
+  finding_rca → storing_results → completed
 """
 
 import os
@@ -31,6 +42,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.utils.db import get_db
 from app.processor.log_processor import fetch_and_compress_logs
+from app.processor.cloudtrail_processor import (
+    fetch_infra_context,
+    format_infra_context_for_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -159,22 +174,6 @@ def _format_log_summary_for_prompt(log_data: dict) -> str:
     """
     Convert the compressed, stage-aware log_processor output into a compact,
     readable text block for the Bedrock prompt.
-
-    Format per log group:
-        ┌─ LOG GROUP: /aws/aiops-test/nginx-error ─────────────────────────────
-        │ STAGE 1 — Pre-failure buildup  [09:43 – 09:48]
-        │   Lines: 42 | Errors: 0 | Warnings: 3
-        │   (no error/warn patterns)
-        │
-        │ STAGE 2 — Failure propagation  [09:48 – 10:00]
-        │   Lines: 187 | Errors: 143 | Warnings: 8
-        │   [x143] [ERROR] access forbidden by rule … request: "GET /pinfo.php …"
-        │   [x8]   [WARN]  upstream response time 29.8 …
-        │
-        │ STAGE 3 — Impact / recovery  [10:00 – 10:10]
-        │   Lines: 31 | Errors: 28 | Warnings: 0
-        │   [x28]  [ERROR] connect() failed (111: Connection refused) …
-        └──────────────────────────────────────────────────────────────────────
     """
     lines = []
 
@@ -182,17 +181,13 @@ def _format_log_summary_for_prompt(log_data: dict) -> str:
     if not per_group:
         return "No log data available."
 
-    stages_meta = {s["name"]: s for s in log_data.get("stages", [])}
-
     for group_name, group_stages in per_group.items():
         lines.append(f"\n╔═ LOG GROUP: {group_name}")
 
         for stage_idx, (sname, summary) in enumerate(group_stages.items(), 1):
             label  = summary.get("stage_label", sname)
             window = summary.get("window", "")
-            lines.append(
-                f"║ STAGE {stage_idx} — {label}  [{window}]"
-            )
+            lines.append(f"║ STAGE {stage_idx} — {label}  [{window}]")
             lines.append(
                 f"║   Lines: {summary['total_raw']} | "
                 f"Errors: {summary['error_count']} | "
@@ -204,8 +199,16 @@ def _format_log_summary_for_prompt(log_data: dict) -> str:
                 for c in clusters:
                     tag    = f"[x{c['count']}]" if c["count"] > 1 else "      "
                     level  = c["level"].upper()
-                    sample = (c["samples"][0] if c["samples"] else c["fingerprint"])[:250]
-                    lines.append(f"║   {tag} [{level}] {sample}")
+                    # Surface cascade and rarity flags
+                    flags  = []
+                    if c.get("is_rare"):
+                        flags.append("[RARE-CRITICAL]")
+                    if c.get("cascade_suspect"):
+                        ups = ",".join(c.get("upstream_services", []))
+                        flags.append(f"[CASCADE↑{ups}]")
+                    flag_str = " ".join(flags) + " " if flags else ""
+                    sample   = (c["samples"][0] if c["samples"] else c["fingerprint"])[:250]
+                    lines.append(f"║   {tag} [{level}] {flag_str}{sample}")
             else:
                 lines.append("║   (no error/warn patterns in this stage)")
 
@@ -223,27 +226,41 @@ def _format_log_summary_for_prompt(log_data: dict) -> str:
 
 
 def _build_prompt(
-    incident_id:        str,
-    issue:              str,
-    severity:           str,
-    down_time_iso:      str,
-    ec2:                dict,
-    metrics:            dict,
-    log_data:           dict,
-    dependency_ctx:     dict,
+    incident_id:    str,
+    issue:          str,
+    severity:       str,
+    down_time_iso:  str,
+    ec2:            dict,
+    metrics:        dict,
+    log_data:       dict,
+    dependency_ctx: dict,
+    infra_ctx:      dict,  
 ) -> str:
-    log_summary_text = _format_log_summary_for_prompt(log_data)
-    top_errors_text  = "\n".join(f"  • {e}" for e in log_data.get("top_errors", []))
+
+    log_summary_text  = _format_log_summary_for_prompt(log_data)
+    top_errors_text   = "\n".join(f"  • {e}" for e in log_data.get("top_errors", []))
+    infra_section     = format_infra_context_for_prompt(infra_ctx)
 
     anchor = log_data.get("anchor", {})
     anchor_text = (
-        f"Pulse detected outage at : {down_time_iso}\n"
-        f"First error in logs      : {anchor.get('first_error_ts') or 'not found'}\n"
-        f"First error group        : {anchor.get('first_error_group') or 'n/a'}\n"
-        f"First error message      : {anchor.get('first_error_msg') or 'n/a'}\n"
-        f"Investigation anchored to: {anchor.get('true_start')}\n"
-        f"Adaptive lookback used   : {log_data.get('adaptive_window', {}).get('before_minutes')} min"
+        f"Pulse detected outage at  : {down_time_iso}\n"
+        f"First error in logs       : {anchor.get('first_error_ts') or 'not found'}\n"
+        f"First error log group     : {anchor.get('first_error_group') or 'n/a'}\n"
+        f"First error message       : {anchor.get('first_error_msg') or 'n/a'}\n"
+        f"Investigation anchored to : {anchor.get('true_start')}\n"
+        f"Adaptive lookback used    : {log_data.get('adaptive_window', {}).get('before_minutes')} min"
     )
+
+    # Infra hypothesis summary (top 3 for the anchor section)
+    infra_hypotheses = infra_ctx.get("hypotheses", [])
+    if infra_hypotheses:
+        hyp_lines = [
+            f"  [{h['confidence'].upper()}] {h['hypothesis']}"
+            for h in infra_hypotheses[:3]
+        ]
+        infra_hyp_text = "\n".join(hyp_lines)
+    else:
+        infra_hyp_text = "  No high-confidence infra hypothesis — lean on log analysis."
 
     d  = ec2.get("details", {})
     sc = ec2.get("status_checks", {})
@@ -268,20 +285,28 @@ def _build_prompt(
 
     dep_text = json.dumps(dependency_ctx, indent=2, default=str) if dependency_ctx else "none"
 
-    return f"""You are a Principal AWS Site Reliability Engineer specialising in EC2 production incidents.
+    return f"""You are a Principal AWS Site Reliability Engineer and forensic incident investigator.
+You have been given BOTH infrastructure change evidence (CloudTrail) AND application log evidence
+(CloudWatch Logs) for an EC2 production incident. Your job is to cross-reference both data sources
+to determine the definitive root cause, who triggered it, why it happened, and how to fix it.
 
 ═══ INCIDENT ═══
 Event ID  : {incident_id}
 Severity  : {severity.upper()}
 Issue     : {issue}
 
-═══ TIME ANCHOR (how investigation windows were computed) ═══
+═══ TIME ANCHOR ═══
 {anchor_text}
 
-Note: Logs are split into stages so you can reason about the timeline precisely.
-Stage 1 = what was happening BEFORE the first error (build-up / degradation).
-Stage 2 = the active failure window (most likely contains root cause).
-Stage 3 = cascading impact and recovery signals AFTER health check failed.
+Note on stages:
+  Stage 1 (buildup)  = what was happening BEFORE the first error — degradation signals.
+  Stage 2 (failure)  = active failure window — most likely contains root cause.
+  Stage 3 (impact)   = cascading errors and recovery signals AFTER health check failed.
+
+═══ INFRA-SIDE HYPOTHESES (CloudTrail — ranked by proximity to first error) ═══
+{infra_hyp_text}
+
+Use these as starting hypotheses.  CONFIRM or REJECT each using the log evidence below.
 
 ═══ EC2 SNAPSHOT ═══
 {ec2_text}
@@ -289,23 +314,58 @@ Stage 3 = cascading impact and recovery signals AFTER health check failed.
 ═══ CLOUDWATCH METRICS (last 15 min before analysis) ═══
 {metrics_text}
 
-═══ TOP ERROR SIGNALS (global, across all log groups) ═══
+═══ TOP ERROR SIGNALS (global, across all log groups, weighted) ═══
 {top_errors_text if top_errors_text else "  (none identified)"}
+
+Flags:
+  [RARE-CRITICAL]    = appeared once but high-severity (OOM, corruption, deadlock)
+  [CASCADE↑service]  = likely a downstream symptom of upstream service failure
+  [x N]              = appeared N times in this stage
 
 ═══ DETAILED LOG ANALYSIS (per group, per stage, deduplicated) ═══
 {log_summary_text}
 
+═══ INFRASTRUCTURE CHANGE EVENTS (CloudTrail) ═══
+{infra_section}
+
 ═══ DEPENDENCY CONTEXT ═══
 {dep_text}
 
-━━━ INSTRUCTIONS ━━━
-Analyse the above EC2 production incident.  Your reasoning should:
-1. Use the stage breakdown to determine WHEN the problem actually started
-   (Stage 1 build-up vs Stage 2 failure — the true start may predate the
-   Pulse detection time).
-2. Correlate error cluster counts and patterns with the CloudWatch metrics.
-3. Identify whether errors in Stage 2 have a single root cause or multiple.
-4. Describe the cascade from Stage 2 → Stage 3 (what broke first, what followed).
+━━━ CROSS-REFERENCE INSTRUCTIONS ━━━
+
+You have four data sources: CloudTrail events, CloudWatch log stages, EC2 metrics,
+and service dependency context.  Use ALL of them together.
+
+STEP 1 — INFRA vs APP DETERMINATION
+  Look at the infra hypotheses above.
+  • If a high-risk infra event (risk >= 8) occurred within 10 min of the first log error:
+    → The root cause is INFRA-TRIGGERED.  The log errors are consequences.
+    → Identify the specific API call, the user who made it, and the resource affected.
+  • If NO infra changes correlate with the first error:
+    → The root cause is APPLICATION-SIDE (code bug, resource exhaustion, dependency failure).
+    → Use Stage 1 build-up patterns to find the earliest signal.
+
+STEP 2 — WHY DID IT HAPPEN
+  • For infra-triggered: Was it intentional (deployment) or accidental (wrong resource)?
+    Was it a failed API call (check "Failed API calls" section) or a successful but wrong change?
+  • For app-triggered: Was it gradual (memory/disk fill) or sudden (crash/OOM)?
+    Which metric correlates: CPU spike, disk ops, network drop?
+
+STEP 3 — BLAST RADIUS
+  • Which services show cascade symptoms ([CASCADE↑x] flags)?
+  • Which log groups have the most Stage 3 errors (post-detection impact)?
+  • Did the incident spread to downstream consumers?
+
+STEP 4 — ROOT CAUSE CHAIN
+  Write the event chain in causal order:
+  [infra change / resource exhaustion / code path] → [first error in logs] →
+  [cascade to Stage 2 errors] → [health check failure / detection] →
+  [Stage 3 impact on downstream]
+
+STEP 5 — WHO, WHAT, WHEN
+  • WHO: CloudTrail actor (user/role) if infra-triggered; application team if app-triggered.
+  • WHAT: The specific change or condition (API call name, resource, config value).
+  • WHEN: Exact timestamp of the triggering event vs first log error vs detection.
 
 IMPORTANT:
 You MUST return ONLY a valid JSON object.
@@ -321,21 +381,32 @@ Your ENTIRE response must:
 - start with {{
 - end with }}
 
-If information is missing, use:
-"unknown"
-
+If information is missing, use "unknown".
 The response MUST be parseable by Python json.loads().
 
 Schema:
 {{
-  "root_cause": "concise technical root cause in 1-2 sentences",
+  "root_cause_type": "infra_triggered | app_triggered | resource_exhaustion | dependency_failure | unknown",
+  "root_cause": "concise 1-2 sentence technical root cause",
   "confidence_score": 0.0-1.0,
-  "actual_incident_start": "best estimate of when problem really started (not detection time)",
-  "impacted_services": ["list of affected services or components"],
-  "severity_assessment": "brief blast-radius assessment",
-  "rca_report": "FULL RCA as single plain-text string covering: summary | timeline (use the 3 stages) | metrics analysis | per-group log analysis | root cause | contributing factors",
-  "remediation_steps": "STEP-BY-STEP plain-text: immediate actions | CLI commands to verify | rollback steps | prevention checklist",
-  "prevention_recommendations": "long-term prevention measures"
+
+  "who": "user/role/team who triggered or is responsible (from CloudTrail or app team if no infra change)",
+  "what": "specific change or condition: API call + resource name, or error pattern + service",
+  "when": "timestamp of the triggering event (CloudTrail event or first log error, whichever came first)",
+
+  "actual_incident_start": "best estimate of when problem really started, not detection time",
+  "impacted_services": ["list of services/components confirmed affected"],
+
+  "causal_chain": "ordered event chain: trigger → first error → cascade → detection → impact",
+  "infra_hypothesis_verdict": "CONFIRMED: <which hypothesis> | REJECTED: <reason> | NOT APPLICABLE: no infra changes",
+
+  "severity_assessment": "brief blast-radius: which systems, how many users, estimated duration",
+
+  "rca_report": "FULL RCA as single plain-text string covering: SUMMARY | TIMELINE (use 3 stages) | METRICS ANALYSIS | INFRA CHANGE ANALYSIS | PER-GROUP LOG ANALYSIS | ROOT CAUSE (with who/what/when) | CONTRIBUTING FACTORS | BLAST RADIUS",
+
+  "remediation_steps": "STEP-BY-STEP plain-text: IMMEDIATE ACTIONS (with AWS CLI commands) | VERIFICATION STEPS | ROLLBACK STEPS | COMMUNICATION TEMPLATE",
+
+  "prevention_recommendations": "LONG-TERM: specific CloudWatch alarms to add | IAM/change-control guardrails | architectural changes | monitoring gaps to close"
 }}
 """
 
@@ -348,7 +419,6 @@ def _invoke_bedrock(prompt: str) -> dict:
     logger.info(f"Invoking Bedrock: {BEDROCK_MODEL}")
     bedrock = boto3.client("bedrock-runtime", region_name=REGION)
 
-    # body = {"prompt": prompt, "max_gen_len": 4096, "temperature": 0.2, "top_p": 0.9}
     body = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": 4096,
@@ -369,11 +439,8 @@ def _invoke_bedrock(prompt: str) -> dict:
     )
     raw  = json.loads(resp["body"].read())
     text = raw["content"][0]["text"]
-    # text = raw.get("generation", raw.get("content", [{}])[0].get("text", ""))
     logger.info("Bedrock response received — parsing...")
-    logger.info(
-        f"[Bedrock Raw Response]\n{text[:8000]}"
-    )
+    logger.info(f"[Bedrock Raw Response]\n{text[:8000]}")
 
     cleaned = re.sub(r"```json|```", "", text).strip()
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
@@ -395,18 +462,25 @@ def _invoke_bedrock(prompt: str) -> dict:
 
 def _fallback_rca(raw_text: str) -> dict:
     return {
+        "root_cause_type":            "unknown",
         "root_cause":                 "AI response parsing failed — manual review required",
         "confidence_score":           0.3,
+        "who":                        "unknown",
+        "what":                       "unknown",
+        "when":                       "unknown",
         "actual_incident_start":      "unknown",
         "impacted_services":          [],
+        "causal_chain":               "unknown",
+        "infra_hypothesis_verdict":   "unknown",
         "severity_assessment":        "Unknown",
         "rca_report":                 raw_text[:3000],
         "remediation_steps": (
             "1. Check EC2 instance health in AWS console\n"
             "2. Review all CloudWatch log groups manually\n"
-            "3. Verify application process is running (systemctl / docker ps)\n"
-            "4. Check disk, memory, and CPU utilisation\n"
-            "5. Inspect security group and network ACL rules"
+            "3. Check CloudTrail for recent infra changes\n"
+            "4. Verify application process is running (systemctl / docker ps)\n"
+            "5. Check disk, memory, and CPU utilisation\n"
+            "6. Inspect security group and network ACL rules"
         ),
         "prevention_recommendations": "Set up CloudWatch alarms for key metrics.",
     }
@@ -417,20 +491,17 @@ def _fallback_rca(raw_text: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 STATUS_PROGRESS = {
-    "queued": 5,
-
-    "fetching_ec2": 15,
-    "fetching_metrics": 25,
-    "fetching_logs": 40,
-
-    "compressing_logs": 55,
-    "building_prompt": 65,
-
-    "finding_rca": 80,
-    "storing_results": 95,
-
-    "completed": 100,
-    "failed": 0,
+    "queued":           5,
+    "fetching_ec2":     12,
+    "fetching_metrics": 20,
+    "fetching_logs":    32,
+    "fetching_infra":   48,    # ← NEW
+    "compressing_logs": 58,
+    "building_prompt":  68,
+    "finding_rca":      82,
+    "storing_results":  95,
+    "completed":        100,
+    "failed":           0,
 }
 
 def _update_status(incident_id: str, status: str) -> None:
@@ -440,7 +511,7 @@ def _update_status(incident_id: str, status: str) -> None:
                 """
                 UPDATE meyiconnect.insight_incidents
                 SET analysis_status = %s,
-                    progress_percent = %s,
+                    analysis_percent = %s,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
@@ -459,7 +530,6 @@ def _parse_time(dt_val) -> datetime | None:
     return None
 
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 6 — Main Entry Point
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -471,7 +541,7 @@ def process_incident(payload: dict) -> None:
     payload requires only {"incident_id": str}.
     All other data is read from meyiconnect.insight_incidents.
 
-    New schema uses a `dependencies` JSONB array:
+    Schema uses a `dependencies` JSONB array:
       [{"instance_id": str, "region": str, "log_group_name": [str, ...]}, ...]
     """
     logger.info("========== INCIDENT PROCESSOR STARTED ==========")
@@ -494,9 +564,7 @@ def process_incident(payload: dict) -> None:
         issue    = incident.get("issue")    or ""
         severity = incident.get("severity") or "medium"
 
-        # ── Parse dependencies array ───────────────────────────────────────────
-        # Schema: dependencies = [{"instance_id": str, "region": str,
-        #                           "log_group_name": [str, ...]}, ...]
+        # ── Parse dependencies ──────────────────────────────────────────────
         raw_deps = incident.get("dependencies") or []
         if isinstance(raw_deps, str):
             try:
@@ -505,16 +573,15 @@ def process_incident(payload: dict) -> None:
                 raw_deps = []
 
         if not raw_deps:
-            logger.error(f"No dependencies defined for incident {incident_id} — cannot process")
+            logger.error(f"No dependencies defined for incident {incident_id}")
             _update_status(incident_id, "failed")
             return
 
-        # Use the first dependency as the primary EC2 target
-        dep = raw_deps[0]
+        dep         = raw_deps[0]
         instance_id = dep.get("instance_id", "")
         region      = dep.get("region") or "ap-south-1"
 
-        # Collect log groups from ALL dependencies (multi-instance support)
+        # Collect log groups from ALL dependencies
         log_groups: list[str] = []
         for d in raw_deps:
             raw_lg = d.get("log_group_name") or d.get("log_group_names") or []
@@ -523,9 +590,8 @@ def process_incident(payload: dict) -> None:
             log_groups.extend([g for g in raw_lg if g])
 
         if not log_groups:
-            logger.warning(f"No log groups for incident {incident_id} — log analysis will be empty")
+            logger.warning(f"No log groups for incident {incident_id}")
 
-        # dependency_ctx for cascade attribution (keep as dict)
         dependency_ctx = incident.get("dependency_context") or {}
         if isinstance(dependency_ctx, str):
             try:
@@ -533,7 +599,6 @@ def process_incident(payload: dict) -> None:
             except Exception:
                 dependency_ctx = {}
 
-        # incident_down_time is the ONLY time we need — everything else is derived
         incident_down_time = _parse_time(incident.get("incident_down_time"))
         if not incident_down_time:
             logger.warning("incident_down_time missing — falling back to now-30min")
@@ -545,43 +610,73 @@ def process_incident(payload: dict) -> None:
             f"log_groups: {log_groups}"
         )
 
-        # ── AWS clients ──────────────────────────────────────────────────────────────
+        # ── AWS clients ──────────────────────────────────────────────────────
         boto_config = Config(max_pool_connections=50)
         ec2_client  = boto3.client("ec2",        region_name=region)
         cw_client   = boto3.client("cloudwatch", region_name=region)
         logs_client = boto3.client("logs",       region_name=region, config=boto_config)
 
-        # ── Fetch EC2 details, metrics, and logs ────────────────────────────────
+        # ── Fetch EC2 details and metrics in parallel ────────────────────────
         _update_status(incident_id, "fetching_ec2")
         ec2 = get_ec2_details(ec2_client, instance_id)
 
         _update_status(incident_id, "fetching_metrics")
         metrics = get_all_metrics(cw_client, instance_id)
 
+        # ── Fetch logs ────────────────────────────────────────────────────────
         log_data = fetch_and_compress_logs(
             logs_client,
             log_groups,
-            incident_down_time,   # ← ONLY timestamp needed
-            severity,             # ← for adaptive window
-            issue,                # ← for adaptive window keyword matching
+            incident_down_time,
+            severity,
+            issue,
             dependency_context=dependency_ctx,
             status_callback=lambda st: _update_status(incident_id, st)
         )
 
         if log_data["total_raw_lines"] == 0:
-            logger.warning(
-                "[RCA Warning] "
-                "No CloudWatch logs retrieved for investigation window"
-            )
+            logger.warning("[RCA Warning] No CloudWatch logs retrieved for investigation window")
 
         logger.info(
-            f"Data fetched | "
+            f"Logs fetched | "
             f"adaptive_window={log_data['adaptive_window']} | "
             f"anchor={log_data['anchor']} | "
             f"stages={[s['name'] for s in log_data['stages']]} | "
             f"error_events={len(log_data['error_events'])} | "
             f"total_raw={log_data['total_raw_lines']}"
         )
+
+        # ── Fetch CloudTrail infra context ────────────────────────────────────
+        # Runs AFTER log fetch so we can pass the log anchor (first_error_ts)
+        # to the correlation engine.
+        _update_status(incident_id, "fetching_infra")
+        try:
+            infra_ctx = fetch_infra_context(
+                region      = region,
+                instance_id = instance_id,
+                down_time   = incident_down_time,
+                anchor      = log_data["anchor"],
+                severity    = severity,
+                issue       = issue,
+            )
+            logger.info(
+                f"Infra context fetched | "
+                f"total_events={infra_ctx.get('total_events', 0)} | "
+                f"high_risk={len(infra_ctx.get('high_risk_events', []))} | "
+                f"hypotheses={len(infra_ctx.get('hypotheses', []))}"
+            )
+        except Exception as exc:
+            logger.warning(f"CloudTrail fetch failed (non-fatal): {exc}")
+            # Don't fail the whole pipeline if CloudTrail is unavailable
+            infra_ctx = {
+                "total_events": 0,
+                "high_risk_events": [],
+                "failed_api_calls": [],
+                "hypotheses": [],
+                "by_user": {},
+                "summary_by_category": {},
+                "window": {},
+            }
 
         # ── Store raw fetched data ─────────────────────────────────────────────
         with get_db() as conn:
@@ -600,10 +695,13 @@ def process_incident(payload: dict) -> None:
                         json.dumps(ec2["details"]),
                         json.dumps(ec2["status_checks"]),
                         json.dumps(metrics),
-                        json.dumps({                         # store structured summary, not raw lines
+                        json.dumps({
                             "anchor":    log_data["anchor"],
                             "stages":    log_data["stages"],
                             "per_group": log_data["per_group"],
+                            # Store infra context alongside logs for audit
+                            "infra_events_count":    infra_ctx.get("total_events", 0),
+                            "infra_high_risk_count": len(infra_ctx.get("high_risk_events", [])),
                         }),
                         log_data["total_raw_lines"],
                     ),
@@ -624,6 +722,7 @@ def process_incident(payload: dict) -> None:
             metrics        = metrics,
             log_data       = log_data,
             dependency_ctx = dependency_ctx,
+            infra_ctx      = infra_ctx,   
         )
 
         # ── Invoke Bedrock ─────────────────────────────────────────────────────
@@ -631,42 +730,33 @@ def process_incident(payload: dict) -> None:
         estimated_tokens = len(prompt) // 4
 
         if estimated_tokens > 25000:
-            logger.warning(
-                f"[Prompt Size Warning] "
-                f"Large prompt detected: ~{estimated_tokens} tokens"
-            )
+            logger.warning(f"[Prompt Size Warning] Large prompt: ~{estimated_tokens} tokens")
 
         logger.info(
             f"[Bedrock Prompt] "
             f"chars={len(prompt)} | "
             f"estimated_tokens={estimated_tokens} | "
             f"top_errors={len(log_data.get('top_errors', []))} | "
-            f"groups={len(log_data.get('per_group', {}))}"
+            f"groups={len(log_data.get('per_group', {}))} | "
+            f"infra_events={infra_ctx.get('total_events', 0)}"
         )
+        logger.info(f"[Bedrock Prompt Preview]\n{prompt[:8000]}")
 
-        logger.info(
-            f"[Bedrock Prompt Preview]\n{prompt[:8000]}"
-        )
         rca = _invoke_bedrock(prompt)
 
         logger.info(
             f"[RCA Summary] "
             f"confidence={rca.get('confidence_score')} | "
+            f"type={rca.get('root_cause_type')} | "
+            f"who={rca.get('who')} | "
             f"root_cause={rca.get('root_cause', '')[:300]}"
         )
 
         # ── Update RCA ──────────────────────────────────────────────────────────
         with get_db() as conn:
             with conn.cursor() as cur:
-
                 confidence_percentage = round(
-                    float(rca.get("confidence_score", 0.5)) * 100,
-                    2
-                )
-
-                impacted_dependencies = (
-                    rca.get("impacted_services")
-                    or rca.get("impacted_dependencies", [])
+                    float(rca.get("confidence_score", 0.5)) * 100, 2
                 )
 
                 cur.execute(
@@ -674,13 +764,11 @@ def process_incident(payload: dict) -> None:
                     UPDATE meyiconnect.insight_incidents
                     SET
                         analysis_status = 'completed',
-                        progress_percent = 100,
-                        processing_status = 'completed',
-                        rca_report = %s,
+                        analysis_percent = 100,
+                        analysis_result = %s,
                         remediation_steps = %s,
                         confidence_score = %s,
                         ai_model_used = %s,
-                        impacted_dependencies = %s,
                         analysis_completed_at = NOW(),
                         updated_at = NOW()
                     WHERE id = %s
@@ -690,13 +778,10 @@ def process_incident(payload: dict) -> None:
                         rca.get("remediation_steps", ""),
                         str(confidence_percentage),
                         BEDROCK_MODEL,
-                        json.dumps(impacted_dependencies),
                         incident_id,
                     ),
                 )
-
                 logger.info(f"Rows updated: {cur.rowcount}")
-
             conn.commit()
 
         logger.info(f"========== EVENT COMPLETED: {incident_id} ==========")
