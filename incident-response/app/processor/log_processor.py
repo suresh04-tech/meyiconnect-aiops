@@ -45,7 +45,7 @@ import math
 import logging
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
+from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -846,6 +846,7 @@ def fetch_and_compress_logs(
     severity:            str = "medium",
     issue:               str = "",
     dependency_context:  dict | None = None,
+    status_callback:     Callable[[str], None] | None = None,
 ) -> dict:
     """
     Full pipeline: Phase A → B → C → D → E.
@@ -860,6 +861,9 @@ def fetch_and_compress_logs(
 
     Returns the full structured analysis dict (see inline docs for schema).
     """
+    if status_callback:
+        status_callback("fetching_logs")
+
     log_groups = [g for g in log_groups if g]
     if not log_groups:
         logger.warning("No log groups — skipping log fetch")
@@ -896,6 +900,9 @@ def fetch_and_compress_logs(
         )
     )
     phase_c_results = _run_phase_c(logs_client, log_groups, stages)
+
+    if status_callback:
+        status_callback("compressing_logs")
 
     # ── Phase D + E ────────────────────────────────────────────────────────────
     cascade_map = _build_cascade_map(dependency_context or {})

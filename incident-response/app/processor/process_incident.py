@@ -403,6 +403,23 @@ def _fallback_rca(raw_text: str) -> dict:
 # SECTION 5 — DB Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
+STATUS_PROGRESS = {
+    "queued": 5,
+
+    "fetching_ec2": 15,
+    "fetching_metrics": 25,
+    "fetching_logs": 40,
+
+    "compressing_logs": 55,
+    "building_prompt": 65,
+
+    "finding_rca": 80,
+    "storing_results": 95,
+
+    "completed": 100,
+    "failed": 0,
+}
+
 def _update_status(incident_id: str, status: str) -> None:
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -412,15 +429,9 @@ def _update_status(incident_id: str, status: str) -> None:
                 SET analysis_status = %s,
                     progress_percent = %s,
                     updated_at = NOW()
-                WHERE incident_id = %s
+                WHERE id = %s
                 """,
-                (status, {
-                    "queued":        5,
-                    "fetching_data": 35,
-                    "finding_rca":   70,
-                    "completed":     100,
-                    "failed":        0,
-                }.get(status, 0), incident_id),
+                (status, STATUS_PROGRESS.get(status, 0), incident_id),
             )
     logger.info(f"Status → '{status}' for {incident_id}")
 
@@ -458,7 +469,7 @@ def process_incident(payload: dict) -> None:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT * FROM meyiconnect.insight_incidents WHERE incident_id = %s LIMIT 1",
+                    "SELECT * FROM meyiconnect.insight_incidents WHERE id = %s LIMIT 1",
                     (incident_id,),
                 )
                 incident = cur.fetchone()
@@ -527,23 +538,22 @@ def process_incident(payload: dict) -> None:
         cw_client   = boto3.client("cloudwatch", region_name=region)
         logs_client = boto3.client("logs",       region_name=region, config=boto_config)
 
-        # ── Fetch EC2 details, metrics, and logs in parallel ───────────────────
-        _update_status(incident_id, "fetching_data")
+        # ── Fetch EC2 details, metrics, and logs ────────────────────────────────
+        _update_status(incident_id, "fetching_ec2")
+        ec2 = get_ec2_details(ec2_client, instance_id)
 
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            f_ec2     = pool.submit(get_ec2_details, ec2_client,  instance_id)
-            f_metrics = pool.submit(get_all_metrics, cw_client,   instance_id)
-            f_logs    = pool.submit(
-                fetch_and_compress_logs,
-                logs_client,
-                log_groups,
-                incident_down_time,   # ← ONLY timestamp needed
-                severity,             # ← for adaptive window
-                issue,                # ← for adaptive window keyword matching
-            )
-            ec2      = f_ec2.result()
-            metrics  = f_metrics.result()
-            log_data = f_logs.result()
+        _update_status(incident_id, "fetching_metrics")
+        metrics = get_all_metrics(cw_client, instance_id)
+
+        log_data = fetch_and_compress_logs(
+            logs_client,
+            log_groups,
+            incident_down_time,   # ← ONLY timestamp needed
+            severity,             # ← for adaptive window
+            issue,                # ← for adaptive window keyword matching
+            dependency_context=dependency_ctx,
+            status_callback=lambda st: _update_status(incident_id, st)
+        )
 
         if log_data["total_raw_lines"] == 0:
             logger.warning(
@@ -590,7 +600,7 @@ def process_incident(payload: dict) -> None:
         logger.info(f"Data stored | log_id: {log_id}")
 
         # ── Build Bedrock prompt ───────────────────────────────────────────────
-        _update_status(incident_id, "finding_rca")
+        _update_status(incident_id, "building_prompt")
 
         prompt = _build_prompt(
             incident_id    = incident_id,
@@ -604,6 +614,7 @@ def process_incident(payload: dict) -> None:
         )
 
         # ── Invoke Bedrock ─────────────────────────────────────────────────────
+        _update_status(incident_id, "finding_rca")
         estimated_tokens = len(prompt) // 4
 
         if estimated_tokens > 25000:
@@ -632,6 +643,7 @@ def process_incident(payload: dict) -> None:
         )
 
         # ── Update RCA ──────────────────────────────────────────────────────────
+        _update_status(incident_id, "storing_results")
         with get_db() as conn:
             with conn.cursor() as cur:
                 confidence_percentage = round(
@@ -650,7 +662,7 @@ def process_incident(payload: dict) -> None:
                         impacted_dependencies = %s,
                         processing_status = 'completed',
                         updated_at = NOW()
-                    WHERE incident_id = %s
+                    WHERE id = %s
                     """,
                     (
                         rca.get("rca_report", ""),
