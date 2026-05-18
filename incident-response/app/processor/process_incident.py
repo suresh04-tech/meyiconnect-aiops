@@ -333,32 +333,38 @@ Schema:
   "actual_incident_start": "best estimate of when problem really started (not detection time)",
   "impacted_services": ["list of affected services or components"],
   "severity_assessment": "brief blast-radius assessment",
-   "rca_report": {
+  "rca_report": {{
         "summary": "",
-        "timeline": {
-        "buildup": "",
-        "failure": "",
-        "impact": ""
-        },
+        "timeline": {{
+            "buildup": "",
+            "failure": "",
+            "impact": ""
+        }},
         "metrics_analysis": "",
         "infra_change_analysis": "",
-        "log_analysis": {
-        "application": "",
-        "nginx": "",
-        "system": "",
-        "database": ""
-        },
+        "log_analysis": {{
+            "application": "",
+            "nginx": "",
+            "system": "",
+            "database": ""
+        }},
         "root_cause_analysis": "",
         "contributing_factors": [],
         "blast_radius": ""
-    },
-  "remediation_steps": {
-    "immediate_actions": [],
-    "verification_steps": [],
-    "rollback_steps": [],
-    "communication_template": ""
-   },
-  "prevention_recommendations": "long-term prevention measures"
+  }},
+  "remediation_steps": {{
+      "immediate_actions": [],
+      "verification_steps": [],
+      "rollback_steps": [],
+      "communication_template": ""
+  }},
+  "prevention_recommendations": {{
+      "monitoring": [],
+      "security": [],
+      "infrastructure": [],
+      "application": [],
+      "operational": []
+  }}
 }}
 """
 
