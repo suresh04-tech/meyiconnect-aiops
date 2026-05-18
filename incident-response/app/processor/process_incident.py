@@ -348,7 +348,19 @@ def _invoke_bedrock(prompt: str) -> dict:
     logger.info(f"Invoking Bedrock: {BEDROCK_MODEL}")
     bedrock = boto3.client("bedrock-runtime", region_name=REGION)
 
-    body = {"prompt": prompt, "max_gen_len": 4096, "temperature": 0.2, "top_p": 0.9}
+    # body = {"prompt": prompt, "max_gen_len": 4096, "temperature": 0.2, "top_p": 0.9}
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 4096,
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    }
     resp = bedrock.invoke_model(
         modelId=BEDROCK_MODEL,
         body=json.dumps(body),
@@ -356,7 +368,8 @@ def _invoke_bedrock(prompt: str) -> dict:
         accept="application/json",
     )
     raw  = json.loads(resp["body"].read())
-    text = raw.get("generation", raw.get("content", [{}])[0].get("text", ""))
+    text = raw["content"][0]["text"]
+    # text = raw.get("generation", raw.get("content", [{}])[0].get("text", ""))
     logger.info("Bedrock response received — parsing...")
     logger.debug(
         f"[Bedrock Raw Response]\n{text[:8000]}"
