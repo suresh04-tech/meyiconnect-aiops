@@ -271,7 +271,7 @@ def _fetch_paginated(logs_client, log_group: str,
                 if e.get("message"):
                     collected.append({"ts": e["timestamp"], "message": e["message"]})
 
-            logger.info(
+            logger.debug(
                 f"[CW page {page}] {log_group}: +{len(events)} events "
                 f"(total so far: {len(collected)})"
             )
@@ -282,7 +282,7 @@ def _fetch_paginated(logs_client, log_group: str,
             if not next_token:
                 break
             if len(collected) >= max_events:
-                logger.info(
+                logger.debug(
                     f"[CW] {log_group}: safety cap {max_events} reached, stopping pagination"
                 )
                 break

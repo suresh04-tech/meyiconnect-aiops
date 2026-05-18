@@ -656,42 +656,50 @@ def process_incident(payload: dict) -> None:
         )
 
         # ── Update RCA ──────────────────────────────────────────────────────────
-        _update_status(incident_id, "storing_results")
         with get_db() as conn:
             with conn.cursor() as cur:
+
                 confidence_percentage = round(
                     float(rca.get("confidence_score", 0.5)) * 100,
                     2
+                )
+
+                impacted_dependencies = (
+                    rca.get("impacted_services")
+                    or rca.get("impacted_dependencies", [])
                 )
 
                 cur.execute(
                     """
                     UPDATE meyiconnect.insight_incidents
                     SET
+                        analysis_status = 'completed',
+                        progress_percent = 100,
+                        processing_status = 'completed',
                         rca_report = %s,
                         remediation_steps = %s,
                         confidence_score = %s,
                         ai_model_used = %s,
                         impacted_dependencies = %s,
-                        processing_status = 'completed',
+                        analysis_completed_at = NOW(),
                         updated_at = NOW()
                     WHERE id = %s
                     """,
                     (
                         rca.get("rca_report", ""),
                         rca.get("remediation_steps", ""),
-                        confidence_percentage,
+                        str(confidence_percentage),
                         BEDROCK_MODEL,
-                        json.dumps(
-                            rca.get("impacted_services")
-                            or rca.get("impacted_dependencies", [])
-                        ),
+                        json.dumps(impacted_dependencies),
                         incident_id,
                     ),
                 )
 
-            _update_status(incident_id, "completed")
-            logger.info(f"========== EVENT COMPLETED: {incident_id} ==========")
+                logger.info(f"Rows updated: {cur.rowcount}")
+
+            conn.commit()
+
+        logger.info(f"========== EVENT COMPLETED: {incident_id} ==========")
 
     except Exception:
         logger.exception(f"Processing failed for event: {incident_id}")
