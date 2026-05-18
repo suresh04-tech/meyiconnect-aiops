@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import incidents, queue
+from app.api.routes import queue
 from app.queue.manager import queue_manager
 from app.processor.worker import start_worker
 
@@ -44,7 +44,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(incidents.router, prefix="/incidents", tags=["Incidents"])
 app.include_router(queue.router, prefix="/queue", tags=["Queue"])
 
 

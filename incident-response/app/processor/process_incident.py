@@ -408,11 +408,19 @@ def _update_status(incident_id: str, status: str) -> None:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE meyiconnect.incidents
-                SET status = %s, updated_at = NOW()
+                UPDATE meyiconnect.insight_incidents
+                SET analysis_status = %s,
+                    progress_percent = %s,
+                    updated_at = NOW()
                 WHERE incident_id = %s
                 """,
-                (status, incident_id),
+                (status, {
+                    "queued":        5,
+                    "fetching_data": 35,
+                    "finding_rca":   70,
+                    "completed":     100,
+                    "failed":        0,
+                }.get(status, 0), incident_id),
             )
     logger.info(f"Status → '{status}' for {incident_id}")
 
@@ -427,31 +435,6 @@ def _parse_time(dt_val) -> datetime | None:
     return None
 
 
-def _parse_log_groups(incident: dict) -> list[str]:
-    """
-    Accept log group names in any format the user might have stored:
-      • JSONB list column   → already a Python list
-      • JSON array string   → '["grp1","grp2"]'
-      • comma-separated     → 'grp1, grp2'
-      • single value        → '/aws/ec2/app'
-    """
-    raw = incident.get("log_group_names") or incident.get("log_group_name") or ""
-
-    if isinstance(raw, list):
-        return [g.strip() for g in raw if str(g).strip()]
-
-    if isinstance(raw, str):
-        s = raw.strip()
-        if s.startswith("["):
-            try:
-                parsed = json.loads(s)
-                return [g.strip() for g in parsed if isinstance(g, str) and g.strip()]
-            except Exception:
-                pass
-        return [g.strip() for g in s.split(",") if g.strip()]
-
-    return []
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 6 — Main Entry Point
@@ -462,18 +445,10 @@ def process_incident(payload: dict) -> None:
     Process a single incident.  Called by the worker thread pool.
 
     payload requires only {"incident_id": str}.
-    All other data is read from meyiconnect.incidents (populated by the Pulse
-    webhook when the health check failed and the user triggered RCA via the UI).
+    All other data is read from meyiconnect.insight_incidents.
 
-    Required DB columns:
-        incident_id       — unique incident identifier
-        instance_id       — EC2 instance ID
-        issue             — free-text description (used for adaptive window)
-        severity          — "critical" / "high" / "medium" / "low"
-        region            — AWS region (default ap-south-1)
-        incident_down_time — UTC timestamp when Pulse detected the failure
-        log_group_names   — one or more CW log group names (JSON array / CSV)
-        dependency_context — optional JSON blob
+    New schema uses a `dependencies` JSONB array:
+      [{"instance_id": str, "region": str, "log_group_name": [str, ...]}, ...]
     """
     logger.info("========== INCIDENT PROCESSOR STARTED ==========")
     incident_id = payload.get("incident_id", "unknown")
@@ -483,7 +458,7 @@ def process_incident(payload: dict) -> None:
         with get_db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT * FROM meyiconnect.incidents WHERE incident_id = %s LIMIT 1",
+                    "SELECT * FROM meyiconnect.insight_incidents WHERE incident_id = %s LIMIT 1",
                     (incident_id,),
                 )
                 incident = cur.fetchone()
@@ -492,11 +467,41 @@ def process_incident(payload: dict) -> None:
             logger.error(f"Incident not found in DB: {incident_id}")
             return
 
-        instance_id = incident["instance_id"]
-        issue       = incident["issue"]       or ""
-        severity    = incident["severity"]    or "medium"
-        region      = incident.get("region")  or "ap-south-1"
+        issue    = incident.get("issue")    or ""
+        severity = incident.get("severity") or "medium"
 
+        # ── Parse dependencies array ───────────────────────────────────────────
+        # Schema: dependencies = [{"instance_id": str, "region": str,
+        #                           "log_group_name": [str, ...]}, ...]
+        raw_deps = incident.get("dependencies") or []
+        if isinstance(raw_deps, str):
+            try:
+                raw_deps = json.loads(raw_deps)
+            except Exception:
+                raw_deps = []
+
+        if not raw_deps:
+            logger.error(f"No dependencies defined for incident {incident_id} — cannot process")
+            _update_status(incident_id, "failed")
+            return
+
+        # Use the first dependency as the primary EC2 target
+        dep = raw_deps[0]
+        instance_id = dep.get("instance_id", "")
+        region      = dep.get("region") or "ap-south-1"
+
+        # Collect log groups from ALL dependencies (multi-instance support)
+        log_groups: list[str] = []
+        for d in raw_deps:
+            raw_lg = d.get("log_group_name") or d.get("log_group_names") or []
+            if isinstance(raw_lg, str):
+                raw_lg = [g.strip() for g in raw_lg.split(",") if g.strip()]
+            log_groups.extend([g for g in raw_lg if g])
+
+        if not log_groups:
+            logger.warning(f"No log groups for incident {incident_id} — log analysis will be empty")
+
+        # dependency_ctx for cascade attribution (keep as dict)
         dependency_ctx = incident.get("dependency_context") or {}
         if isinstance(dependency_ctx, str):
             try:
@@ -507,13 +512,8 @@ def process_incident(payload: dict) -> None:
         # incident_down_time is the ONLY time we need — everything else is derived
         incident_down_time = _parse_time(incident.get("incident_down_time"))
         if not incident_down_time:
-            # Hard fallback: if somehow not set, use now - 30 min
             logger.warning("incident_down_time missing — falling back to now-30min")
             incident_down_time = datetime.now(timezone.utc) - timedelta(minutes=30)
-
-        log_groups = _parse_log_groups(incident)
-        if not log_groups:
-            logger.warning(f"No log groups for incident {incident_id} — log analysis will be empty")
 
         logger.info(
             f"Event: {incident_id} | instance: {instance_id} | region: {region} | "
@@ -593,7 +593,7 @@ def process_incident(payload: dict) -> None:
         _update_status(incident_id, "finding_rca")
 
         prompt = _build_prompt(
-            incident_id       = incident_id,
+            incident_id    = incident_id,
             issue          = issue,
             severity       = severity,
             down_time_iso  = incident_down_time.isoformat(),
@@ -631,33 +631,42 @@ def process_incident(payload: dict) -> None:
             f"root_cause={rca.get('root_cause', '')[:300]}"
         )
 
-        # ── Store RCA ──────────────────────────────────────────────────────────
+        # ── Update RCA ──────────────────────────────────────────────────────────
         with get_db() as conn:
             with conn.cursor() as cur:
+                confidence_percentage = round(
+                    float(rca.get("confidence_score", 0.5)) * 100,
+                    2
+                )
+
                 cur.execute(
                     """
-                    INSERT INTO meyiconnect.incident_rca (
-                        incident_id, rca_report, remediation_steps,
-                        confidence_score, ai_model_used,
-                        impacted_dependencies, processing_status
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, 'completed')
+                    UPDATE meyiconnect.insight_incidents
+                    SET
+                        rca_report = %s,
+                        remediation_steps = %s,
+                        confidence_score = %s,
+                        ai_model_used = %s,
+                        impacted_dependencies = %s,
+                        processing_status = 'completed',
+                        updated_at = NOW()
+                    WHERE incident_id = %s
                     """,
                     (
-                        incident_id,
                         rca.get("rca_report", ""),
                         rca.get("remediation_steps", ""),
-                        float(rca.get("confidence_score", 0.5)),
+                        confidence_percentage,
                         BEDROCK_MODEL,
                         json.dumps(
                             rca.get("impacted_services")
                             or rca.get("impacted_dependencies", [])
                         ),
+                        incident_id,
                     ),
                 )
 
-        _update_status(incident_id, "completed")
-        logger.info(f"========== EVENT COMPLETED: {incident_id} ==========")
+            _update_status(incident_id, "completed")
+            logger.info(f"========== EVENT COMPLETED: {incident_id} ==========")
 
     except Exception:
         logger.exception(f"Processing failed for event: {incident_id}")
