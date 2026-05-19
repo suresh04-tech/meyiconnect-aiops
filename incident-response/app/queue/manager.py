@@ -33,7 +33,7 @@ class QueueManager:
         await self._q.put(payload)
         self._enqueued += 1
         logger.info(
-            f"[Queue] Enqueued event_id={payload.get('event_id')} | "
+            f"[Queue] Enqueued incident_id={payload.get('incident_id')} | "
             f"queue_size={self._q.qsize()}"
         )
 

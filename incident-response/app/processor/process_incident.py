@@ -526,12 +526,21 @@ def process_incident(payload: dict) -> None:
             logger.error(f"Incident not found in DB: {incident_id}")
             return
 
+        # ── Validate Required Fields ───────────────────────────────────────────
+        if not incident.get("incident_down_time"):
+            logger.error(f"Missing incident_down_time for incident {incident_id}")
+            _update_status(incident_id, "failed")
+            return
+            
+        if not incident.get("dependency_context"):
+            logger.error(f"Missing dependency_context for incident {incident_id}")
+            _update_status(incident_id, "failed")
+            return
+
         issue    = incident.get("issue")    or ""
         severity = incident.get("severity") or "medium"
 
         # ── Parse dependencies array ───────────────────────────────────────────
-        # Schema: dependencies = [{"instance_id": str, "region": str,
-        #                           "log_group_name": [str, ...]}, ...]
         raw_deps = incident.get("dependencies") or []
         if isinstance(raw_deps, str):
             try:
@@ -546,8 +555,18 @@ def process_incident(payload: dict) -> None:
 
         # Use the first dependency as the primary EC2 target
         dep = raw_deps[0]
-        instance_id = dep.get("instance_id", "")
-        region      = dep.get("region") or "ap-south-1"
+        instance_id = dep.get("instance_id")
+        region      = dep.get("region")
+        
+        if not instance_id:
+            logger.error(f"Missing instance_id in dependencies for incident {incident_id}")
+            _update_status(incident_id, "failed")
+            return
+            
+        if not region:
+            logger.error(f"Missing region in dependencies for incident {incident_id}")
+            _update_status(incident_id, "failed")
+            return
 
         # Collect log groups from ALL dependencies (multi-instance support)
         log_groups: list[str] = []
@@ -558,21 +577,26 @@ def process_incident(payload: dict) -> None:
             log_groups.extend([g for g in raw_lg if g])
 
         if not log_groups:
-            logger.warning(f"No log groups for incident {incident_id} — log analysis will be empty")
+            logger.error(f"Missing log_group_name in dependencies for incident {incident_id}")
+            _update_status(incident_id, "failed")
+            return
 
-        # dependency_ctx for cascade attribution (keep as dict)
-        dependency_ctx = incident.get("dependency_context") or {}
+        # dependency_ctx for cascade attribution
+        dependency_ctx = incident.get("dependency_context")
         if isinstance(dependency_ctx, str):
             try:
                 dependency_ctx = json.loads(dependency_ctx)
             except Exception:
-                dependency_ctx = {}
+                logger.error(f"dependency_context is invalid JSON for incident {incident_id}")
+                _update_status(incident_id, "failed")
+                return
 
-        # incident_down_time is the ONLY time we need — everything else is derived
+        # incident_down_time
         incident_down_time = _parse_time(incident.get("incident_down_time"))
         if not incident_down_time:
-            logger.warning("incident_down_time missing — falling back to now-30min")
-            incident_down_time = datetime.now(timezone.utc) - timedelta(minutes=30)
+            logger.error(f"Invalid incident_down_time for {incident_id}")
+            _update_status(incident_id, "failed")
+            return
 
         logger.info(
             f"Event: {incident_id} | instance: {instance_id} | region: {region} | "
@@ -596,9 +620,9 @@ def process_incident(payload: dict) -> None:
         log_data = fetch_and_compress_logs(
             logs_client,
             log_groups,
-            incident_down_time,   # ← ONLY timestamp needed
-            severity,             # ← for adaptive window
-            issue,                # ← for adaptive window keyword matching
+            incident_down_time,   
+            severity,             
+            issue,
             dependency_context=dependency_ctx,
             status_callback=lambda st: _update_status(incident_id, st)
         )
