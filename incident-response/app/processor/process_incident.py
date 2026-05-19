@@ -298,6 +298,54 @@ Stage 3 = cascading impact and recovery signals AFTER health check failed.
 ═══ DEPENDENCY CONTEXT ═══
 {dep_text}
 
+═══ RCA REASONING GUIDELINES ═══
+
+When analysing incidents:
+
+1. Prioritize the most direct technical evidence from logs over generic symptoms.
+
+2. Distinguish carefully between:
+   - infrastructure failure
+   - dependency saturation
+   - application bugs
+   - network issues
+   - authentication failures
+   - resource exhaustion
+
+3. If a dependency is still responding with explicit application/database errors,
+   do NOT classify it as a network outage.
+
+4. Correlate:
+   - log timelines
+   - metrics spikes
+   - repeated error patterns
+   - failure propagation stages
+
+5. Prefer the MOST SPECIFIC root cause supported by evidence.
+
+6. Avoid generic conclusions such as:
+   - "network issue"
+   - "database unavailable"
+   unless logs explicitly support those conclusions.
+
+7. Differentiate between:
+   - root cause
+   - downstream impact
+   - secondary failures
+
+8. Remediation steps must:
+   - address the actual root cause
+   - include immediate mitigation
+   - include permanent fix recommendations
+   - include operational validation steps
+
+9. Avoid generic remediation such as:
+   - "check logs"
+   - "investigate issue"
+   - "contact support"
+
+10. Use infrastructure metrics, timeline stages, and clustered log evidence together before concluding root cause.
+
 ━━━ INSTRUCTIONS ━━━
 Analyse the above EC2 production incident.  Your reasoning should:
 1. Use the stage breakdown to determine WHEN the problem actually started
