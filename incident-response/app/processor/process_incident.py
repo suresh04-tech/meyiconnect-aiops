@@ -346,6 +346,39 @@ When analysing incidents:
 
 10. Use infrastructure metrics, timeline stages, and clustered log evidence together before concluding root cause.
 
+═══ RCA ANALYSIS METHODOLOGY ═══
+
+Your task is not to summarize logs.
+
+Your task is to infer:
+1. The most probable underlying operational failure mechanism
+2. Why the system degraded
+3. Why the impact propagated
+4. What evidence supports the conclusion
+5. What remediation directly fixes the underlying issue
+
+Do NOT stop at surface symptoms such as:
+- timeout
+- HTTP 500
+- connection error
+
+Determine WHY those symptoms occurred.
+
+Differentiate:
+- primary root cause
+- secondary symptoms
+- cascading failures
+
+Prefer infrastructure/application behavior patterns over isolated log lines.
+
+Repeated failures + increasing latency + dependency timeouts + stable EC2 metrics usually indicate:
+- dependency saturation
+- resource exhaustion
+- connection pool exhaustion
+- downstream bottlenecks
+
+NOT infrastructure outage.
+
 ━━━ INSTRUCTIONS ━━━
 Analyse the above EC2 production incident.  Your reasoning should:
 1. Use the stage breakdown to determine WHEN the problem actually started
