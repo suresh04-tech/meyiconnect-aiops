@@ -531,11 +531,6 @@ def process_incident(payload: dict) -> None:
             logger.error(f"Missing incident_down_time for incident {incident_id}")
             _update_status(incident_id, "failed")
             return
-            
-        if not incident.get("dependency_context"):
-            logger.error(f"Missing dependency_context for incident {incident_id}")
-            _update_status(incident_id, "failed")
-            return
 
         issue    = incident.get("issue")    or ""
         severity = incident.get("severity") or "medium"
@@ -581,15 +576,13 @@ def process_incident(payload: dict) -> None:
             _update_status(incident_id, "failed")
             return
 
-        # dependency_ctx for cascade attribution
-        dependency_ctx = incident.get("dependency_context")
+        # dependency_ctx for cascade attribution (keep as dict)
+        dependency_ctx = incident.get("dependency_context") or {}
         if isinstance(dependency_ctx, str):
             try:
                 dependency_ctx = json.loads(dependency_ctx)
             except Exception:
-                logger.error(f"dependency_context is invalid JSON for incident {incident_id}")
-                _update_status(incident_id, "failed")
-                return
+                dependency_ctx = {}
 
         # incident_down_time
         incident_down_time = _parse_time(incident.get("incident_down_time"))
