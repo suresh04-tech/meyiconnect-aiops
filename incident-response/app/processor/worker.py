@@ -29,16 +29,16 @@ async def start_worker(manager: QueueManager) -> None:
 
     while True:
         payload = await manager.get()
-        event_id = payload.get("event_id", "unknown")
-        logger.info(f"[Worker] Picked up event_id={event_id}")
+        incident_id = payload.get("incident_id", "unknown")
+        logger.info(f"[Worker] Picked up incident_id={incident_id}")
 
         loop = asyncio.get_running_loop()
         try:
             await loop.run_in_executor(_executor, process_incident, payload)
             manager.mark_processed()
-            logger.info(f"[Worker] Completed event_id={event_id}")
+            logger.info(f"[Worker] Completed incident_id={incident_id}")
         except Exception:
             manager.mark_failed()
-            logger.exception(f"[Worker] Failed event_id={event_id}")
+            logger.exception(f"[Worker] Failed incident_id={incident_id}")
         finally:
             manager.task_done()
