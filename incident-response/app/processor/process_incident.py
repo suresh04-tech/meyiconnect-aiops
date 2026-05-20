@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.utils.db import get_db
 from app.processor.log_processor import fetch_and_compress_logs
+from botocore.config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -462,14 +463,21 @@ Schema:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _invoke_bedrock(prompt: str) -> dict:
-    logger.info(f"Invoking Bedrock: {BEDROCK_MODEL}")
-    bedrock = boto3.client("bedrock-runtime", region_name=REGION)
 
-    # body = {"prompt": prompt, "max_gen_len": 4096, "temperature": 0.2, "top_p": 0.9}
+    logger.info(f"Invoking Bedrock: {BEDROCK_MODEL}")
+
+    config = Config(
+        read_timeout=300,
+        retries={
+            "max_attempts": 3
+        }
+    )
+    bedrock = boto3.client("bedrock-runtime", region_name=REGION, config=config)
+
     body = {
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 4096,
-        "temperature": 0.2,
+        "max_tokens": 8192,
+        "temperature": 0.1,
         "top_p": 0.9,
         "messages": [
             {
@@ -486,7 +494,6 @@ def _invoke_bedrock(prompt: str) -> dict:
     )
     raw  = json.loads(resp["body"].read())
     text = raw["content"][0]["text"]
-    # text = raw.get("generation", raw.get("content", [{}])[0].get("text", ""))
     logger.info("Bedrock response received — parsing...")
     logger.info(
         f"[Bedrock Raw Response]\n{text[:8000]}"
