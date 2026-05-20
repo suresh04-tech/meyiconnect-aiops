@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.utils.db import get_db
 from app.processor.log_processor import fetch_and_compress_logs
-from botocore.config import Config
+from app.utils.aws_connector import AWSClientFactory
 
 logger = logging.getLogger(__name__)
 
@@ -462,7 +462,7 @@ Schema:
 # SECTION 4 — Bedrock Invocation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _invoke_bedrock(prompt: str) -> dict:
+def _invoke_bedrock(prompt: str, aws_factory: AWSClientFactory) -> dict:
 
     logger.info(f"Invoking Bedrock: {BEDROCK_MODEL}")
 
@@ -472,7 +472,7 @@ def _invoke_bedrock(prompt: str) -> dict:
             "max_attempts": 3
         }
     )
-    bedrock = boto3.client("bedrock-runtime", region_name=REGION, config=config)
+    bedrock = aws_factory.get_client("bedrock-runtime", region_name=REGION, config=config)
 
     body = {
         "anthropic_version": "bedrock-2023-05-31",
@@ -686,17 +686,26 @@ def process_incident(payload: dict) -> None:
             _update_status(incident_id, "failed")
             return
 
+        connector_id = incident.get("connector_id")
+        
         logger.info(
             f"Event: {incident_id} | instance: {instance_id} | region: {region} | "
             f"severity: {severity} | down_time: {incident_down_time.isoformat()} | "
-            f"log_groups: {log_groups}"
+            f"log_groups: {log_groups} | connector: {connector_id or 'type=aws'}"
         )
 
         # ── AWS clients ──────────────────────────────────────────────────────────────
+        try:
+            aws_factory = AWSClientFactory(connector_id)
+        except ValueError as e:
+            logger.error(f"AWS Connector initialization failed: {e}")
+            _update_status(incident_id, "failed")
+            return
+
         boto_config = Config(max_pool_connections=50)
-        ec2_client  = boto3.client("ec2",        region_name=region)
-        cw_client   = boto3.client("cloudwatch", region_name=region)
-        logs_client = boto3.client("logs",       region_name=region, config=boto_config)
+        ec2_client  = aws_factory.get_client("ec2",        region_name=region)
+        cw_client   = aws_factory.get_client("cloudwatch", region_name=region)
+        logs_client = aws_factory.get_client("logs",       region_name=region, config=boto_config)
 
         # ── Fetch EC2 details, metrics, and logs ────────────────────────────────
         _update_status(incident_id, "fetching_ec2")
@@ -794,7 +803,7 @@ def process_incident(payload: dict) -> None:
         logger.info(
             f"[Bedrock Prompt Preview]\n{prompt[:8000]}"
         )
-        rca = _invoke_bedrock(prompt)
+        rca = _invoke_bedrock(prompt, aws_factory)
 
         logger.info(
             f"[RCA Summary] "

@@ -701,6 +701,7 @@ def format_infra_context_for_prompt(infra_ctx: dict) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def fetch_infra_context(
+    cloudtrail_client,
     region:         str,
     instance_id:    str,
     down_time:      datetime,
@@ -713,6 +714,7 @@ def fetch_infra_context(
     Full CloudTrail pipeline for one incident.
 
     Args:
+        cloudtrail_client boto3 client for CloudTrail
         region          AWS region of the primary instance
         instance_id     EC2 instance ID (for logging/context only; we scan all events)
         down_time       When the health check detected the failure
@@ -742,10 +744,8 @@ def fetch_infra_context(
     )
 
     try:
-        ct_client = boto3.client("cloudtrail", region_name=region)
-
         # Phase A — fetch
-        raw_events = _fetch_cloudtrail_events(ct_client, scan_start, scan_end)
+        raw_events = _fetch_cloudtrail_events(cloudtrail_client, scan_start, scan_end)
 
         if not raw_events:
             logger.info("[CloudTrail] No matching infra events in window")
