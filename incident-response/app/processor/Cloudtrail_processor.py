@@ -46,7 +46,6 @@ Then pass infra_ctx into _build_prompt() as a new parameter.
 
 import json
 import logging
-import boto3
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
