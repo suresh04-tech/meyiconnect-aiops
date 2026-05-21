@@ -62,12 +62,25 @@ def _resolve_alb_dns_to_arn(elbv2_client, dns_name: str) -> Optional[str]:
     AWS doesn't have a 'lookup by DNS' API, so we page through all ALBs
     in the account/region and match on DNSName (case-insensitive).
     """
+
+    normalized_dns = (
+        dns_name
+        .replace("http://", "")
+        .replace("https://", "")
+        .strip("/")
+        .lower()
+    )
+
     paginator = elbv2_client.get_paginator("describe_load_balancers")
     for page in paginator.paginate():
         for lb in page.get("LoadBalancers", []):
-            if lb.get("DNSName", "").lower() == dns_name.lower():
+             alb_dns = lb.get("DNSName", "").lower()
+             if alb_dns == normalized_dns:
                 arn = lb["LoadBalancerArn"]
-                logger.info(f"[ALB resolver] Matched DNS '{dns_name}' → ARN '{arn}'")
+                logger.info(
+                    f"[ALB resolver] Matched DNS "
+                    f"'{normalized_dns}' → ARN '{arn}'"
+                )
                 return arn
 
     logger.warning(f"[ALB resolver] No ALB found for DNS name: {dns_name}")
@@ -140,7 +153,7 @@ def resolve_alb(dep: dict, aws_factory) -> tuple[list[dict], dict]:
         dep.get("log_group_name") or dep.get("log_group_names")
     )
 
-    elbv2 = aws_factory.get_client("elasticloadbalancingv2", region_name=region)
+    elbv2 = aws_factory.get_client("elbv2", region_name=region)
 
     # Step 1 — DNS → ARN
     alb_arn = _resolve_alb_dns_to_arn(elbv2, resource_id)
