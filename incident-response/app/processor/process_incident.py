@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 REGION        = os.environ.get("AWS_REGION", "ap-south-1")
-BEDROCK_MODEL = os.environ.get("BEDROCK_MODEL_ID", "meta.llama3-8b-instruct-v1:0")
+BEDROCK_MODEL = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-3-sonnet-20240229-v1:0")
 
 # Max parallel instance collectors
 MAX_COLLECTOR_WORKERS = int(os.environ.get("MAX_COLLECTOR_WORKERS", "10"))
@@ -277,13 +277,12 @@ def collect_all_instances(
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 4 — Prompt Builder (multi-instance aware)
 # ═══════════════════════════════════════════════════════════════════════════════
-
 def _format_log_summary_for_prompt(log_data: dict) -> str:
-    lines = []
+    lines     = []
     per_group = log_data.get("per_group", {})
     if not per_group:
         return "No log data available."
-
+ 
     for group_name, group_stages in per_group.items():
         lines.append(f"\n╔═ LOG GROUP: {group_name}")
         for stage_idx, (sname, summary) in enumerate(group_stages.items(), 1):
@@ -306,267 +305,275 @@ def _format_log_summary_for_prompt(log_data: dict) -> str:
                 lines.append("║   (no error/warn patterns in this stage)")
             lines.append("║")
         lines.append("╚" + "═" * 60)
-
     return "\n".join(lines)
-
-
-def _build_instance_matrix_text(correlation: dict) -> str:
-    """Format the comparison matrix for the prompt."""
+ 
+ 
+def _fmt(v) -> str:
+    return f"{v:.1f}" if v is not None else "n/a"
+ 
+ 
+def _build_matrix_text(correlation: dict) -> str:
+    """
+    Tight per-instance table — unhealthy instances first.
+    Each row: ID | health | CPU | ALB-target | errors | top error snippet
+    """
     rows  = correlation.get("comparison_matrix", [])
     lines = []
     for r in rows:
-        health_icon = "✗ UNHEALTHY" if r["health"] == "unhealthy" else "✓ healthy"
+        icon  = "✗" if r["health"] == "unhealthy" else "✓"
         lines.append(
-            f"  [{health_icon}] {r['instance_id']}"
-            f"  CPU={r['cpu']}%"
-            f"  EC2-status={r['status_check']}"
-            f"  ALB-target={r['target_health']}"
+            f"  {icon} {r['instance_id']}"
+            f"  cpu={r['cpu']}%"
+            f"  ec2={r['status_check']}"
+            f"  alb={r['target_health']}"
             f"  errors={r['error_count']}"
         )
-        if r["target_reason"]:
-            lines.append(f"    ↳ ALB reason: {r['target_reason']}")
-        if r["top_errors"]:
-            for e in r["top_errors"][:2]:
-                lines.append(f"    ↳ {e[:150]}")
-    return "\n".join(lines)
-
+        if r.get("target_reason"):
+            lines.append(f"    └ ALB reason : {r['target_reason']}")
+        for e in r.get("top_errors", [])[:2]:
+            lines.append(f"    └ {e[:160]}")
+    return "\n".join(lines) if lines else "  (no instances)"
+ 
+ 
+def _unhealthy_instance_list(correlation: dict) -> str:
+    rows = [r for r in correlation.get("comparison_matrix", [])
+            if r["health"] == "unhealthy"]
+    if not rows:
+        return "none"
+    return ", ".join(r["instance_id"] for r in rows)
 
 def _build_prompt_multi(
-    incident_id:    str,
-    issue:          str,
-    severity:       str,
-    down_time_iso:  str,
-    instance_analyses: dict,   # {iid: analysis}
-    correlation:    dict,
-    alb_meta:       dict,
-    dependency_ctx: dict,
+    incident_id:         str,
+    issue:               str,
+    severity:            str,
+    down_time_iso:       str,
+    instance_analyses:   dict,   # {iid: analysis_dict}
+    correlation:         dict,
+    alb_meta:            dict,
+    dependency_ctx:      dict,
     primary_instance_id: str,
 ) -> str:
     """
-    Build Bedrock prompt for multi-instance (ALB-aware) analysis.
-    Uses a compact comparison matrix to avoid token explosion.
-    Primary suspect gets full log details; others get summary-only.
+    Build Bedrock prompt for multi-instance (ALB-aware) RCA.
+ 
+    Design goals
+    ────────────
+    1. Instance-specific — failing instance ID is called out explicitly in
+       every section so the AI can name it in root_cause and remediation.
+    2. Scenario-guided reasoning — scenario A/B/C/D constrains hypothesis space
+       before the AI writes a single word of analysis.
+    3. Remediation quality — 3-point structure: immediate fix, verification,
+       prevention. Each point names the specific instance/command/metric.
+    4. Token-efficient — unhealthy instances get full detail; healthy instances
+       appear only in the compact matrix (no log dump).
     """
-    primary = instance_analyses.get(primary_instance_id, {})
-    primary_log = primary.get("log_summary", {})
-
+ 
+    # ── Primary instance data ────────────────────────────────────────────────
+    primary      = instance_analyses.get(primary_instance_id, {})
+    primary_log  = primary.get("log_summary", {})
+    primary_ec2  = primary.get("ec2", {})
+    primary_m    = primary.get("metrics", {})
+ 
     log_summary_text = _format_log_summary_for_prompt(primary_log)
     top_errors_text  = "\n".join(
         f"  • {e}" for e in primary_log.get("top_errors", [])
+    ) or "  (none)"
+ 
+    anchor      = primary_log.get("anchor", {})
+    ec2_d       = primary_ec2.get("details", {})
+    ec2_sc      = primary_ec2.get("status_checks", {})
+    tgt_health  = primary.get("target_health", "unknown")
+    tgt_reason  = primary.get("target_reason", "") or "—"
+ 
+    # ── Scenario metadata ────────────────────────────────────────────────────
+    scenario      = correlation.get("scenario", "?")
+    scenario_desc = correlation.get("scenario_description", "")
+    unhealthy_ids = _unhealthy_instance_list(correlation)
+    matrix_text   = _build_matrix_text(correlation)
+ 
+    common_errors = "\n".join(
+        f"  • {e}" for e in correlation.get("common_errors", [])
+    ) or "  (none — errors are isolated to specific instance(s))"
+ 
+    isolated_errors_text = json.dumps(
+        correlation.get("isolated_errors", {}), indent=2
     )
-
-    anchor = primary_log.get("anchor", {})
-    anchor_text = (
-        f"Pulse detected outage at : {down_time_iso}\n"
-        f"First error in logs      : {anchor.get('first_error_ts') or 'not found'}\n"
-        f"First error group        : {anchor.get('first_error_group') or 'n/a'}\n"
-        f"First error message      : {anchor.get('first_error_msg') or 'n/a'}\n"
-        f"Investigation anchored to: {anchor.get('true_start')}\n"
-        f"Adaptive lookback used   : {primary_log.get('adaptive_window', {}).get('before_minutes')} min"
-    )
-
-    primary_ec2 = primary.get("ec2", {})
-    d  = primary_ec2.get("details", {})
-    sc = primary_ec2.get("status_checks", {})
-    primary_ec2_text = (
-        f"Instance : {d.get('instance_id')} ({d.get('instance_type')})  "
-        f"State: {d.get('state')}  AZ: {d.get('availability_zone')}\n"
-        f"Status   : instance={sc.get('instance_status')}  system={sc.get('system_status')}\n"
-        f"Tags     : {json.dumps(d.get('tags', {}))}"
-    )
-
-    def _fmt(v):
-        return f"{v:.2f}" if v is not None else "n/a"
-
-    m = primary.get("metrics", {})
-    primary_metrics_text = (
-        f"CPU: {_fmt(m.get('cpu_percent'))}%  "
-        f"NetIn: {_fmt(m.get('network_in_bytes'))} B  "
-        f"NetOut: {_fmt(m.get('network_out_bytes'))} B  "
-        f"DiskRd: {_fmt(m.get('disk_read_ops'))} ops  "
-        f"DiskWr: {_fmt(m.get('disk_write_ops'))} ops  "
-        f"StatusFailed: {_fmt(m.get('status_check_failed'))}"
-    )
-
-    scenario       = correlation.get("scenario", "?")
-    scenario_desc  = correlation.get("scenario_description", "")
-    matrix_text    = _build_instance_matrix_text(correlation)
-    common_errors  = "\n".join(f"  • {e}" for e in correlation.get("common_errors", []))
-    isolated_errors_text = json.dumps(correlation.get("isolated_errors", {}), indent=2)
-
-    alb_text = ""
+ 
+    # ── ALB block ────────────────────────────────────────────────────────────
+    alb_block = ""
     if alb_meta:
-        alb_text = (
-            f"ALB DNS           : {alb_meta.get('alb_dns')}\n"
-            f"Total targets     : {alb_meta.get('total')}\n"
-            f"Healthy targets   : {alb_meta.get('healthy')}\n"
-            f"Unhealthy targets : {alb_meta.get('unhealthy')}\n"
+        alb_block = (
+            f"ALB DNS      : {alb_meta.get('alb_dns', 'n/a')}\n"
+            f"Targets      : {alb_meta.get('total', '?')} total  "
+            f"| {alb_meta.get('healthy', '?')} healthy  "
+            f"| {alb_meta.get('unhealthy', '?')} unhealthy\n"
         )
-
-    dep_text = json.dumps(dependency_ctx, indent=2, default=str) if dependency_ctx else "none"
-
-    return f"""You are a Principal AWS Site Reliability Engineer with deep expertise in diagnosing production incidents through causal chain analysis.
-
-Your role is NOT to summarize logs. Your role is to reason like a senior SRE conducting a live postmortem.
-
-═══ INCIDENT ═══
-Event ID  : {incident_id}
-Severity  : {severity.upper()}
-Issue     : {issue}
-
-═══ TIME ANCHOR ═══
-{anchor_text}
-
-Note: Logs are split into 3 stages for precise timeline reasoning:
-  Stage 1 (buildup)  — system state BEFORE the first error.
-  Stage 2 (failure)  — the active failure window. Root cause manifests here.
-  Stage 3 (impact)   — cascading failures AFTER health check failed. These are SYMPTOMS, not causes.
-
-═══ INFRASTRUCTURE OVERVIEW ═══
-Total instances  : {correlation.get('total_count', 1)}
-Healthy          : {correlation.get('healthy_count', 0)}
-Unhealthy        : {correlation.get('unhealthy_count', 0)}
-Primary suspect  : {primary_instance_id}
-Scenario         : {scenario} — {scenario_desc}
-
-{alb_text}
-
-═══ INSTANCE COMPARISON MATRIX ═══
-(All instances behind the ALB — sorted by failure severity)
-
+ 
+    dep_text = (
+        json.dumps(dependency_ctx, indent=2, default=str)
+        if dependency_ctx else "none"
+    )
+ 
+    # ── Metrics block (primary instance only) ────────────────────────────────
+    metrics_text = (
+        f"CPU            : {_fmt(primary_m.get('cpu_percent'))}%\n"
+        f"NetworkIn      : {_fmt(primary_m.get('network_in_bytes'))} B\n"
+        f"NetworkOut     : {_fmt(primary_m.get('network_out_bytes'))} B\n"
+        f"DiskReadOps    : {_fmt(primary_m.get('disk_read_ops'))}\n"
+        f"DiskWriteOps   : {_fmt(primary_m.get('disk_write_ops'))}\n"
+        f"StatusCheckFailed: {_fmt(primary_m.get('status_check_failed'))}"
+    )
+ 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    return f"""You are a Principal AWS SRE conducting a live postmortem.
+Do NOT summarize — reason causally and be specific to the failing instance(s).
+ 
+━━━ INCIDENT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ID       : {incident_id}
+Severity : {severity.upper()}
+Issue    : {issue}
+Detected : {down_time_iso}
+First error in logs : {anchor.get('first_error_ts') or 'not found'}
+First error message : {anchor.get('first_error_msg') or 'n/a'}
+Adaptive lookback   : {primary_log.get('adaptive_window', {}).get('before_minutes')} min
+ 
+━━━ INFRASTRUCTURE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+{alb_block}Failing instance(s): {unhealthy_ids}
+Primary suspect     : {primary_instance_id}
+Scenario            : {scenario} — {scenario_desc}
+ 
+Instance comparison (✗ = unhealthy, ✓ = healthy):
 {matrix_text}
-
-Cross-instance observations:
-  Errors shared by ALL instances (shared dependency signal):
-{common_errors if common_errors else "  (none — errors are isolated)"}
-
-  Errors isolated to specific instances:
+ 
+Errors common to ALL instances (→ shared dependency):
+{common_errors}
+ 
+Errors isolated to specific instance(s) (→ host/app-level):
 {isolated_errors_text}
-
-═══ PRIMARY SUSPECT — DEEP ANALYSIS ({primary_instance_id}) ═══
-
-EC2 Snapshot:
-{primary_ec2_text}
-
-CloudWatch Metrics (last 15 min):
-{primary_metrics_text}
-
-Metrics interpretation guide:
-  • Low CPU + no disk pressure + connection timeouts → dependency saturation or connection pool exhaustion, NOT host failure
-  • High CPU + disk pressure → resource exhaustion on EC2 itself
-  • All metrics clean → failure is external (dependency, network policy, auth)
-  • StatusCheckFailed=1 → underlying host issue regardless of app logs
-
-Top Error Signals (global, across all log groups):
-{top_errors_text if top_errors_text else "  (none identified)"}
-
-Detailed Log Analysis (per group, per stage, deduplicated):
+ 
+━━━ PRIMARY SUSPECT: {primary_instance_id} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EC2 state     : {ec2_d.get('state')}  ({ec2_d.get('instance_type')})  AZ: {ec2_d.get('availability_zone')}
+Status checks : instance={ec2_sc.get('instance_status')}  system={ec2_sc.get('system_status')}
+ALB target    : {tgt_health}  reason={tgt_reason}
+Tags          : {json.dumps(ec2_d.get('tags', {}))}
+ 
+CloudWatch metrics (last 15 min):
+{metrics_text}
+ 
+Metric rules:
+  • CPU low + no disk pressure + timeouts  → dependency issue, NOT host failure
+  • CPU high + disk pressure               → resource exhaustion on this EC2
+  • All metrics clean                      → external dependency / network / auth
+  • StatusCheckFailed=1                    → host-level failure, check EC2 console
+ 
+Top error signals ({primary_instance_id}):
+{top_errors_text}
+ 
+Log detail — 3 stages (buildup → failure → impact):
+  Stage 1 = pre-failure state  |  Stage 2 = ROOT CAUSE WINDOW  |  Stage 3 = cascades (not causes)
 {log_summary_text}
-
-═══ DEPENDENCY CONTEXT ═══
+ 
+━━━ DEPENDENCY CONTEXT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {dep_text}
-
-═══ CAUSAL CHAIN REASONING FRAMEWORK ═══
-
-IMPORTANT — Use the scenario classification above to guide your reasoning:
-
-Scenario A (single instance failing):
-  → Focus on: host-level failure, application bug, OOM, disk full, stuck process
-  → Other instances being healthy is key evidence AGAINST shared dependency outage
-
-Scenario B (all instances failing):
-  → Focus on: shared dependency (DB, Redis, external API, VPC/security group, DNS)
-  → Host-level explanations are RULED OUT when all instances fail identically
-
-Scenario C (ALB-level issue):
-  → Focus on: health check misconfiguration, port mismatch, security group blocking health check path
-  → Instance-level explanations are LESS likely when instances themselves are healthy
-
-Scenario D (partial failure):
-  → Consider: rolling deployment, AZ-specific issue, canary regression, load imbalance
-
-You must reason through these layers IN ORDER before writing your conclusion:
-
-LAYER 1 — SYMPTOM (what the logs report)
-LAYER 2 — MECHANISM (what failure mode produced those symptoms)
-LAYER 3 — TRIGGER (what caused the mechanism)
-LAYER 4 — ROOT CAUSE (single underlying operational failure — most specific actionable statement)
-LAYER 5 — CASCADE PATH (how root cause propagated)
-
-═══ CRITICAL REASONING RULES ═══
-
-1. Use the comparison matrix. If only one instance is failing, do NOT conclude shared dependency.
-2. If all instances share the same error, shared dependency is the primary hypothesis.
-3. EC2 metrics are your control group — healthy metrics = EC2 host is NOT the problem.
-4. Duration clustering (e.g. all timeouts at exactly 9000ms) = saturation, not outage.
-5. Do NOT attribute failures to cloud provider infrastructure unless you have explicit evidence.
-6. Differentiate: root_cause vs trigger vs cascade. Never list cascades as root causes.
-7. Every remediation step must answer: "Why does THIS step fix THIS root cause?"
-
-═══ OUTPUT INSTRUCTIONS ═══
-
-You MUST return ONLY a valid JSON object. No markdown, no explanations, no ```json fences.
-Your ENTIRE response must start with {{ and end with }}.
-
-Schema:
+ 
+━━━ REASONING FRAMEWORK ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Work through these IN ORDER. Reference {primary_instance_id} by name throughout.
+ 
+Scenario guidance:
+  A (single instance failing) → host bug / OOM / disk / stuck process on {primary_instance_id}.
+    Other instances healthy = EVIDENCE AGAINST shared dependency. Do not conclude shared dep.
+  B (all instances failing)   → shared dependency (DB/Redis/DNS/VPC). Rule out host causes.
+  C (ALB issue only)          → health-check misconfiguration / port mismatch / SG rule.
+  D (partial failure)         → rolling deploy / AZ issue / canary regression.
+ 
+LAYER 1 — SYMPTOM      What error messages? HTTP codes? Timeout values?
+LAYER 2 — MECHANISM    Why did those errors occur on {primary_instance_id} specifically?
+LAYER 3 — TRIGGER      What changed or threshold was crossed just before Stage 2?
+LAYER 4 — ROOT CAUSE   Single most specific actionable statement.
+                        BAD : "database was unavailable"
+                        GOOD: "psycopg2 pool on {primary_instance_id} exhausted because all N
+                               connections blocked on 9 s connect_timeout to saturated Postgres,
+                               cascading HTTP 500s to ALB"
+LAYER 5 — CASCADE      How did root cause propagate into Stage 3?
+ 
+Hard rules:
+  • Name {primary_instance_id} explicitly in root_cause, not just "the instance".
+  • Duration clustering (e.g. all timeouts at ~9 s) = saturation, not outage.
+  • Do NOT attribute to AWS provider failure unless provider event is in the logs.
+  • Cascades (Stage 3) are NEVER root causes.
+ 
+━━━ REMEDIATION RULES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+immediate_actions   : EXACTLY 3 steps. Each must name {primary_instance_id} or the specific
+                      resource to fix. Format: "<action> on <target> — <why this fixes root cause>"
+                      No generic advice ("check logs", "restart app") unless restart IS the fix
+                      and you explain why it clears the specific failure mode.
+verification_steps  : EXACTLY 3 checks. Each must name a specific metric, log pattern, or
+                      HTTP status code to confirm recovery. Example format:
+                      "Confirm ALB UnHealthyHostCount for {primary_instance_id} drops to 0
+                       in CloudWatch within 60 s of fix"
+prevention          : EXACTLY 2 steps. Long-term fixes to prevent recurrence.
+ 
+━━━ OUTPUT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Return ONLY valid JSON. No markdown, no fences, no text outside the object.
+Start with {{ end with }}.
+ 
 {{
-  "root_cause": "Single precise technical statement. Include: what failed, why, evidence. 2-3 sentences.",
-
+  "root_cause": "Precise 2-sentence statement naming {primary_instance_id} explicitly.
+                 What failed, why, what evidence confirms it.",
+ 
   "confidence_score": 0.0-1.0,
-
-  "actual_incident_start": "ISO timestamp of when problem actually started (Stage 2 onset)",
-
-  "impacted_services": ["directly affected services — not cascades"],
-
-  "severity_assessment": "Blast radius: what was broken, what was NOT broken, scope of user impact",
-
-  "infrastructure_scenario": "{scenario} — {scenario_desc}",
-
+ 
+  "failing_instances": ["{primary_instance_id}"],
+ 
+  "actual_incident_start": "ISO timestamp — Stage 2 onset, not detection time",
+ 
+  "impacted_services": ["directly affected services only — no cascades"],
+ 
+  "severity_assessment": "What broke, what did NOT break, estimated user impact",
+ 
+  "infrastructure_scenario": "Scenario letter + one-line description",
+ 
   "rca_report": {{
-    "summary": "2-3 sentence executive summary: what broke, why, and impact",
-
+ 
+    "summary": "2-3 sentences: what broke on which instance, why, user impact",
+ 
     "timeline": {{
-      "buildup": "Stage 1 findings. Healthy or early signals? Timestamps.",
-      "failure": "Stage 2 trigger. Precise moment and mechanism of failure onset.",
-      "impact":  "How Stage 2 cascaded into Stage 3."
+      "buildup": "Stage 1 — was {primary_instance_id} healthy? Early signals? Timestamps.",
+      "failure": "Stage 2 — exact onset moment and mechanism on {primary_instance_id}.",
+      "impact":  "Stage 3 — how failure on {primary_instance_id} cascaded downstream."
     }},
-
-    "instance_analysis": "Summary of which instances failed and which were healthy. Key differences between instances.",
-
-    "metrics_analysis": "Explicit interpretation of each metric for the primary suspect. What each metric rules IN or OUT.",
-
-    "infra_change_analysis": "Evidence of config/deployment/infrastructure changes before incident. If none: state explicitly.",
-
-    "log_analysis": {{
-      "application": "Application log findings — error counts, timing patterns, failure type.",
-      "nginx": "Nginx log findings, or 'not available'",
-      "system": "System-level log findings, or 'not available'",
-      "database": "Database-side findings. If not directly available, infer from app-side DB errors."
-    }},
-
-    "root_cause_analysis": "Full causal chain: Symptom → Mechanism → Trigger → Root Cause. Postmortem-quality prose.",
-
-    "contributing_factors": ["Factors that worsened the incident but are not root cause"],
-
-    "blast_radius": "What was unavailable, for how long, what was unaffected"
+ 
+    "instance_analysis": "Which instances failed vs healthy. Key metric/log differences that
+                          confirm the failure was isolated to {primary_instance_id} (or shared).",
+ 
+    "metrics_analysis": "Interpret each metric for {primary_instance_id}. State explicitly
+                         what each metric rules IN or OUT as a cause.",
+ 
+    "root_cause_analysis": "Postmortem-quality causal chain for {primary_instance_id}:
+                            Symptom → Mechanism → Trigger → Root Cause. Cite Stage 2 evidence."
   }},
-
+ 
   "remediation_steps": {{
+ 
     "immediate_actions": [
-      "Specific and directly addresses root cause.",
-      "Include exact command/config change/operation.",
-      "State WHY each action works against the identified root cause."
+      "1. <specific action> on {primary_instance_id} — <why this clears the root cause>",
+      "2. <specific action> on <exact resource> — <why>",
+      "3. <specific action> — <why>"
     ],
-
+ 
     "verification_steps": [
-      "Specific checks to confirm recovery. Exact log patterns or metrics to look for."
+      "1. <metric or log pattern to check> — expected value after fix",
+      "2. <HTTP/ALB health check result to verify> — expected outcome",
+      "3. <CloudWatch alarm or log absence to confirm> — expected state"
     ],
-
-    "rollback_steps": [
-      "If a recent change is implicated. Otherwise: 'No rollback applicable — failure was operational, not change-induced.'"
+ 
+    "prevention": [
+      "1. <long-term architectural or config change> — prevents recurrence because <reason>",
+      "2. <monitoring or alerting improvement> — detects this failure class earlier because <reason>"
     ],
-
-    "communication_template": "Plain-language status update for stakeholders."
+ 
+    "communication_template": "One paragraph. Plain language. State: what is broken, which
+                               instance is affected, what is being done, next update ETA."
   }}
 }}
 """
